@@ -11,6 +11,7 @@ import math
 from .mem_allocator import SimpleMemoryAllocator
 
 import hashlib
+import subprocess
 
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
@@ -21,6 +22,13 @@ def get_caller_loc():
             break
         frame = frame.f_back
     return loc
+
+def get_git_revision_hash() -> str:
+    try:
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD']).decode('ascii').strip()
+    except Exception as e:
+        print(f'warning: get git revision error: {e}')
+        return 'unknown'
 
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
@@ -137,11 +145,15 @@ class GPRExpr:
                 return GPRExpr("<<", self, shift_left_bits)
         return GPRExpr("*", self, other)
     def __floordiv__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        shift_right_bits = other.bit_length() - 1
-        return GPRExpr(">>", self, shift_right_bits)
+        if isinstance(other, int):
+            if other <= 0 or (other & (other - 1)) != 0:
+                # the divisor is not power of 2
+                return GPRExpr("floordiv", self, other)
+            else:
+                shift_right_bits = other.bit_length() - 1
+                return GPRExpr(">>", self, shift_right_bits)
+        else:
+            return GPRExpr("floordiv", self, other)
     def __mod__(self, other):
         assert isinstance(other, int)
         if other <= 0 or (other & (other - 1)) != 0:
@@ -382,28 +394,13 @@ class GPRs:
     def __rsub__(self, other):
         return GPRExpr("-", other, self.to_expr())
     def __mul__(self, other):
-        if isinstance(other, int) and other >= 0:
-            if (other & (other - 1)) == 0:
-                shift_left_bits = other.bit_length() - 1
-                return GPRExpr("<<", self.to_expr(), shift_left_bits)
-        return GPRExpr("*", self.to_expr(), other)
+        return self.to_expr().__mul__(other)
     def __rmul__(self, other):
-        if isinstance(other, int) and other >= 0:
-            if (other & (other - 1)) == 0:
-                shift_left_bits = other.bit_length() - 1
-                return GPRExpr("<<", self.to_expr(), shift_left_bits)
-        return GPRExpr("*", self.to_expr(), other)
+        return self.to_expr().__rmul__(other)
     def __floordiv__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        shift_right_bits = other.bit_length() - 1
-        return GPRExpr(">>", self.to_expr(), shift_right_bits)
+        return self.to_expr().__floordiv__(other)
     def __mod__(self, other):
-        assert isinstance(other, int)
-        if other <= 0 or (other & (other - 1)) != 0:
-            assert 0, "the divisor is not power of 2"
-        return GPRExpr("&", self.to_expr(), (other-1))
+        return self.to_expr().__mod__(other)
     def __lshift__(self, other):
         return GPRExpr("<<", self.to_expr(), other)
     def __rlshift__(self, other):
@@ -833,9 +830,15 @@ class JIT:
         dst_is_sgprx2 = isinstance(dst, GPRs) and dst.rtype == "s" and dst.count == 2
         dst_is_vcc = isinstance(dst, str) and dst == "vcc"
         dst_is_exec = isinstance(dst, str) and dst == "exec"
+        dst_is_scc = isinstance(dst, str) and dst == "scc"
         #assert dst_is_vcc or dst_is_sgprx2
+        rtype = "v"
+        if dst_is_scc:
+            rtype = "s"
+        if isinstance(dst, GPRs):
+            rtype = dst.rtype
         dtype = cond.find_dtype()
-        dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
+        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1)
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
         self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
         last_inst = self.current_bb.instructions[-1]
@@ -860,6 +863,15 @@ class JIT:
             last_inst.operands[3] == "vcc" :
             self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
             self.current_bb.instructions.pop()
+        elif dst_is_scc and \
+            last_inst.opcode == "s_mov_b32" and \
+            last_inst.operands[0] is dst_expr and \
+            last_inst.operands[1] == "scc" :
+            self.log("s_mov_b32 dst,scc is optimized")
+            self.current_bb.instructions.pop()
+        elif dst_is_scc:
+            # generate scc
+            self.s_cmp_lg_i32(0, dst_gprs)
         else:
             # generate mask into dst (vcc or sgprx2)
             self.v_cmp_ne_u32_e64(dst, 0, dst_gprs)
@@ -984,7 +996,7 @@ class JIT:
 
         # allocate GPRs
         dtype = desc[-1]
-        assert isinstance(dtype, str)
+        assert isinstance(dtype, str), f"{dtype=}"
 
         num_gprs = 1
         shape = []
@@ -1379,7 +1391,7 @@ class JIT:
             new_inst(dst_expr, expr)
             return
 
-        if dtype == "" or (dtype not in ["u32", "s32"]):
+        if dtype == "" or (dtype not in ["u32", "i32"]):
             if expr.op not in ["&","|","^"]:
                 dtype = expr.find_dtype()
                 self.log(f"infer dtype={dtype} by expr {expr}")
@@ -1417,7 +1429,7 @@ class JIT:
                 return Instruction(bb, f"v_add_u32_e32" if op == '+' else f"v_sub_u32_e32", loc=loc)
             if isinstance(src0_operand, GPRExpr):
                 if op == '-':
-                    src1_operand = hex(-src1_operand & 0xffffffff)
+                    src1_operand = hex((-src1_operand) & 0xffffffff)
                 # v_add_u32_e32's src0 can be const
                 src1_operand, src0_operand = src0_operand, src1_operand
                 return Instruction(bb, f"v_add_u32_e32", loc=loc) # vgpr + (+/- const)
@@ -1532,6 +1544,110 @@ class JIT:
                 mov(dst_expr, 0, 1, "vcc")
             else:
                 assert 0, f"unsupported rtype: {rtype}"
+        elif expr.op == "floordiv":
+            # from Hacker's Delight: use multiply+shift to calculate div
+            assert dtype in ["u32","i32"]
+            def find_min_k(d, n_max, allow_eq = False):
+                k = 32
+                while True:
+                    mod = (1 << k) % d
+                    if allow_eq and (1 << k) == n_max * (d - mod):
+                        return k
+                    elif (1 << k) > n_max * (d - mod):
+                        return k
+                    k += 1
+            assert rtype == "s"
+            if isinstance(src1_operand, int):
+                d = src1_operand
+                if dtype == "u32":
+                    assert d > 0
+                    """
+                    a = n/d
+                    b = n*[2**k/d + e]/2**k = n/d + (n*e/2**k) = a + (n*e/2**k)
+                         e is error introduced by ceil(2**k/d): [d-(2**k % d)]/d
+
+                    floor(b) = floor(a) when (e/2**k) < 1/d because a=n/d, floor(a+1/d) may > floor(a)
+                    so we need 2**k > e*d = n*[d-(2**k % d)]
+                    """
+                    n_max = 2**32-1
+                    min_k = find_min_k(d, n_max)
+                    ceil_sd = (2**min_k + d - 1)//d
+                    assert ceil_sd < 2**32
+                    Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
+                    Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                else:
+                    """
+                    consider negative as a mirror of positive
+                    """
+                    #assert d > 0
+                    abs_d = abs(d)
+                    min_k = max(find_min_k(abs_d, 2**31 - 1), find_min_k(abs_d, 2**31, True))
+                    ceil_sd = (2**min_k + abs_d - 1)//abs_d
+                    assert ceil_sd < 2**32, f"{d=} {min_k=} {ceil_sd=} {hex(ceil_sd)=}"
+                    need_compensation = 0 if ceil_sd < 2**31 else 1
+                    if d < 0:
+                        ceil_sd = (-ceil_sd) # restore sign of divisor
+
+                    need_compensation = 0
+                    if ceil_sd >= 2**31:
+                        # sd will be interpreted as (sd - 2^32) by s_mul_hi_i32
+                        # and get n*(sd - 2^32), need compensate it by adding n*2^32
+                        need_compensation = 1
+                    elif ceil_sd < -2**31:
+                        # sd will be interpreted as (sd + 2^32) by s_mul_hi_i32
+                        # and get n*(sd + 2^32), need compensate it by sub n*2^32
+                        need_compensation = -1
+                    ceil_sd = ceil_sd & 0xFFFFFFFF
+
+                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                    Instruction(bb, f"s_mul_hi_i32", loc=loc)(dst_expr, src0_operand, ceil_sd)
+                    if need_compensation == 1:
+                        Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
+                    if need_compensation == -1:
+                        Instruction(bb, f"s_sub_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
+                    Instruction(bb, f"s_lshr_b32", loc=loc)(temp, dst_expr, 31)
+                    Instruction(bb, f"s_ashr_i32", loc=loc)(dst_expr, dst_expr, min_k-32)
+                    # when n/d < 0, arithematic shift right 1 bit is floor(n/2)
+                    # so extra compensation is needed for C/C++'s rounding-toward-zero result
+                    Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, temp)
+            else:
+                # assert src1_operand.find_rtype() == "s"
+                # copied from hip compiler's output
+                s2 = src0_operand
+                s3 = self.gpr("su32")
+                s4 = self.gpr("su32")
+                s5 = self.gpr("su32")
+                s6 = self.gpr("su32")
+                s7 = self.gpr("su32")
+                v1 = self.gpr("vu32")
+                self.s_abs_i32(s4, src1_operand)
+                self.v_cvt_f32_u32_e32(v1, s4)
+                self.s_sub_i32(s5, 0, s4)
+                self.s_xor_b32(s3, s2, src1_operand)
+                self.s_abs_i32(dst_expr, s2)
+                self.v_rcp_iflag_f32_e32(v1, v1)
+                self.s_ashr_i32(s3, s3, 31)
+                self.v_mul_f32_e32(v1, 0x4f7ffffe, v1)
+                self.v_cvt_u32_f32_e32(v1, v1)
+                self.s_nop(mod="0")
+                self.v_readfirstlane_b32(s6, v1)
+                self.s_mul_i32(s5, s5, s6)
+                self.s_mul_hi_u32(s5, s6, s5)
+                self.s_add_i32(s6, s6, s5)
+                self.s_mul_hi_u32(s5, dst_expr, s6)
+                self.s_mul_i32(s6, s5, s4)
+                self.s_sub_i32(dst_expr, dst_expr, s6)
+                self.s_add_i32(s7, s5, 1)
+                self.s_sub_i32(s6, dst_expr, s4)
+                self.s_cmp_ge_u32(dst_expr, s4)
+                self.s_cselect_b32(s5, s7, s5)
+                self.s_cselect_b32(dst_expr, s6, dst_expr)
+                self.s_add_i32(s6, s5, 1)
+                self.s_cmp_ge_u32(dst_expr, s4)
+                self.s_cselect_b32(dst_expr, s6, s5)
+                self.s_xor_b32(dst_expr, dst_expr, s3)
+                self.s_sub_i32(dst_expr, dst_expr, s3)
+                # assert 0, f"TODO floordiv {rtype=} {dtype=} {dst_expr=} {src0_operand=} {src1_operand=}"
         else:
             assert 0, f"unsupported expression {expr}"
 
@@ -2360,9 +2476,16 @@ class JIT:
             # which causes damage to kernal-arg pointer s[0:1], we can work-around it by putting
             # these 2 lines of codes at the end of the kernel's source code.
             decl_lds += f"    __shared__ uint lds_buffer[{self.lds_allocator.upper_bound()//4}];\n"
-            decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));'
+            decl_lds += f'    asm(" ; lds_buffer %0 "::"s"((as3_uint32_ptr)(lds_buffer)));\n'
             pass
 
+        # embed revision into bin
+        git_commit = [rf'".pushsection .rodata\n"']
+        git_commit += [rf'"    .align 8\n"']
+        git_commit += [rf'"    .asciz  \".git:{get_git_revision_hash()}\"\n"']
+        git_commit += [rf'"    .popsection"']
+        git_commit = '\n'.join(git_commit)
+        git_commit = f'''    asm volatile({git_commit});\n'''
         hip_src =r'''
 #include <hip/hip_fp16.h> // for __fp16
 #include <hip/hip_bf16.h> // for bfloat16
@@ -2376,7 +2499,7 @@ __global__ void ''' + kernel_name + signature +  r''' {
 r'''
                 ::
                 :"memory"''' + str_used_gprs + r''');
-''' + decl_lds + r'''
+''' + decl_lds + git_commit + r'''
 }
         '''
 
