@@ -76,3 +76,9 @@ jobs:
 ```bash
 rocprofv3 -i config.yaml -- python myapp.py
 ```
+
+If you see an error such as
+```
+[rocprofv3] Fatal error: rocprof-trace-decoder library path not found in ['/opt/rocm/lib', '/opt/rocm-7.1.0/lib']
+```
+please download and install [rocprof-trace-decoder](https://github.com/ROCm/rocprof-trace-decoder/releases) from the release packages.
