@@ -23,3 +23,8 @@ dt = 3085.08992 us
 dt = 3088.33003 us
 
 ```
+
+## Profile
+```
+ /opt/rocm-7.1.0/bin/rocprofv3 -i inputs.json -o ./att-logs -- python3 flash-attention-minimal.py
+```

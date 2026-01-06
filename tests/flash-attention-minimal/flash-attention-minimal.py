@@ -56,7 +56,7 @@ def manual_attn(q, k, v):
     return y
 
 
-def test_ALiBi():
+def test_flash_attn_minimal():
 
     kernel = forward_kernel
 
@@ -108,7 +108,6 @@ def test_ALiBi():
 
     print(f"Max shared memory: {max_sram_size}, requested shared memory: {sram_size}")
 
-    # 4. 安全校验
     if sram_size > max_sram_size:
         raise MemoryError(
             f"The requested shared memory ({sram_size} bytes) exceeds the hardware limit ({max_sram_size} bytes)! Please try reducing the size of Bc or Br."
@@ -173,4 +172,4 @@ def test_ALiBi():
 
 
 if __name__ == "__main__":
-    test_ALiBi()
+    test_flash_attn_minimal()
