@@ -78,8 +78,20 @@ def moe_gemm_loop(J:JIT,
         for n in range(B_horz):
             J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
 
+    for m in range(A_vert):
+        buff_a.load_dwordx4(A_reg[0, m, 0], voffset_a[m], 0)
+        if weight_dtype != torch.bfloat16:
+            buff_a.load_dwordx4(A_reg[0, m, 1], voffset_a[m], 16)
+
     # ping pong register buffer id
     pp_reg_id = 0
+    for n in range(B_horz):
+        buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
+
+    soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
+    soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
+    pp_reg_id = pp_reg_id ^ 1
+
     k_step_wg = num_split_k * 32 if weight_dtype == torch.bfloat16 else num_split_k * 64
 
     # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
@@ -89,23 +101,33 @@ def moe_gemm_loop(J:JIT,
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
 
-    def load_gen(pp_reg_id):
-        for m in range(A_vert):
-            buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
-            if weight_dtype != torch.bfloat16:
-                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka + 16)
-        for n in range(B_horz):
-            yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
+    def loop(is_first, is_tail, pp_reg_id):
+        #nonlocal pp_reg_id
+        # [16,32] * [2,16,32] => [2,16,16]
+        if not is_tail:
+            for m in range(A_vert):
+                buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
+                if weight_dtype != torch.bfloat16:
+                    buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka + 16)
+            for n in range(B_horz):
+                buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
 
-        soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
-        soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
-        if weight_dtype == torch.bfloat16:
-            J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert})")
+            pp_reg_id = pp_reg_id ^ 1
+            soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
+            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
+            if weight_dtype == torch.bfloat16:
+                J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert})")
+            else:
+                J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * 2})")
         else:
-            J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * 2})")
-    
-    def mfma_gen(pp_reg_id):
+            pp_reg_id = pp_reg_id ^ 1
+            J.s_waitcnt(mod=f"vmcnt(0)")
+
         if weight_dtype != torch.bfloat16:
+            if is_first:
+                for n in range(B_horz):
+                    J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
+
             # decompress
             v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
             v_w_bf16 = J.gpr(B_horz, 2, 'vf32', align=4)
@@ -125,33 +147,12 @@ def moe_gemm_loop(J:JIT,
                     # 2, A_rep, 2, 2
                     for n in range(B_horz):
                         for m in range(A_vert):
-                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
+                            J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
         else:
             for m in range(A_vert):
                 for n in range(B_horz):
-                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
-                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
-
-    def loop(pp_reg_id):
-        loader = load_gen(pp_reg_id)
-        mfma = mfma_gen(1 - pp_reg_id)
-
-        J.emitter()([loader])
-
-        J.emitter()([mfma])
-
-    # prolog
-    loader = load_gen(0)
-    J.emitter()([loader])
-    if weight_dtype != torch.bfloat16:
-        for n in range(B_horz):
-            J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
-    pp_reg_id = 1
-
-    def tail(pp_reg_id):
-        J.s_waitcnt(mod=f"vmcnt(0)")
-        mfma = mfma_gen(pp_reg_id)
-        J.emitter()([mfma])
+                    J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
+                    J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
 
     if isinstance(K, int):
         if weight_dtype == torch.bfloat16:
@@ -159,35 +160,36 @@ def moe_gemm_loop(J:JIT,
         else:
             # a wave needs at least 64 elements
             assert K % 64 == 0, 'K must be multiple of 64'
-    
-        for k in range(0, k_max - 1):
-            loop(pp_reg_id)
+        loop(True, False, pp_reg_id)
+        pp_reg_id ^= 1
+        for k in range(1, k_max - 1):
+            loop(False, False, pp_reg_id)
             pp_reg_id ^= 1
-
-        # tail
-        tail(1 - pp_reg_id)
-
+        loop(False, True, pp_reg_id)
+        pp_reg_id ^= 1
     else:
         cur_k = J.gpr("si32")
         cur_k[0] = 0
         # at least 2 blocks, TODO: add check?
         k_loop_cnt = K // k_step_wg - 2
-
+        loop(True, False, pp_reg_id)
+        pp_reg_id ^= 1
         # unroll 2 times for pin/pong buffer, align #loop to even
-        with J.While(cur_k[0] < k_loop_cnt):
-            loop(1)
-            loop(0)
+        k_loop_cnt_even = J.gpr(k_loop_cnt & 0xfffffffe)
+        with J.While(cur_k[0] < k_loop_cnt_even):
+            loop(False, False, pp_reg_id)
+            pp_reg_id ^= 1
+            loop(False, False, pp_reg_id)
+            pp_reg_id ^= 1
             cur_k[0] += 2
-        J.Jump("odd_k_block", cur_k[0] == k_loop_cnt + 1)
-        # there are 2 blocks left
-        loop(1)
-        # tail
-        tail(1)
+        J.Jump("odd_k_block", cur_k[0] < k_loop_cnt)
+        loop(False, True, pp_reg_id)
         J.Jump("k_block_end")
         # 1 block + tail
         J.Label("odd_k_block")
-        # tail
-        tail(0)
+        loop(False, False, pp_reg_id)
+        pp_reg_id ^= 1
+        loop(False, True, pp_reg_id)
         J.Label("k_block_end")
 
 @jit()
@@ -577,7 +579,7 @@ def moe_gemm_batch_vmn(J:JIT,
     v_sorted_id = J.gpr(A_vert, 'vu32')
     J.global_load_dword(v_sorted_id[0], lane_mod_16 << 2, p_sorted_ids)
     for n in range(1, A_vert):
-        p_sorted_ids[:] += 16 * 4
+        p_sorted_ids[:] += n * 16 * 4
         J.global_load_dword(v_sorted_id[n], lane_mod_16 << 2, p_sorted_ids)
     voffset_b = J.gpr(B_horz, 'vu32')
     if with_silu:
@@ -594,7 +596,7 @@ def moe_gemm_batch_vmn(J:JIT,
         for m in range(1, B_horz):
             voffset_b[m] = voffset_b[0] + K * (16 * sizeof_w * m)
         for m in range(1, A_vert):
-            p_sorted_weights[:] += 16 * 4
+            p_sorted_weights[:] += m * 16 * 4
             J.global_load_dword(v_weight[m], lane_mod_16 << 2, p_sorted_weights)
 
     p_output[:] = p_output[:] + (BLOCK_TILE_SIZE_N_HALF if with_silu else BLOCK_TILE_SIZE_N) * J.blockIdx.x * sizeof_bf16
@@ -680,7 +682,6 @@ def moe_gemm_batch_vmn(J:JIT,
                 vaddr = J.gpr(v_token_id * (N // 2 * sizeof_bf16 * TOPK) + v_topk_id * (N // 2 * sizeof_bf16) + lane_mod_16 * sizeof_bf16 + n * 16 * sizeof_bf16)
                 with J.ExecMask(v_token_id < M[0]):
                     J.global_store_short_d16_hi(vaddr, out[0], p_output)
-            J.s_barrier()
     else:
         for n in range(B_horz):
             # split N
@@ -699,7 +700,285 @@ def moe_gemm_batch_vmn(J:JIT,
                     J.global_atomic_pk_add_bf16(vaddr    , creg_low[0], p_output)
                     J.global_atomic_pk_add_bf16(vaddr + 4, creg_low[1], p_output)
 
-@jit()
+
+def down_kernel(J, mfma_MN, num_mfma_n, BM, N, K,
+                A, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
+                lds_token_ids,  # 256 int32 token_id
+                lds_weights,    # 256 fp32 weights 
+                pB:"void*",
+                pC:"void*",
+                M):
+    sizeof_DW = 4
+    sizeof_DW2 = sizeof_DW * 2
+    sizeof_DW4 = sizeof_DW * 4
+    sizeof_bf16 = 2
+
+    #pA[:] = pA[:] + J.blockIdx.x * (M*K*sizeof_bf16)
+    #pB[:] = pB[:] + J.blockIdx.x * (N*K*sizeof_bf16)
+    #pC[:] = pC[:] + J.blockIdx.x * (M*N*sizeof_bf16)
+
+    # given DW4 lane size, how many bf16 items along K direction
+    mfma_K = (64//mfma_MN) * (sizeof_DW4//sizeof_bf16) # mfma_K = 32
+
+    # load A [BM x K] bf16 into AccGPRs 
+    num_mfma_m = J.div(BM, mfma_MN)
+    num_mfma_k = J.div(K, mfma_K)  # K=96, num_mfma_k=3
+
+    """
+    A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
+    buff_a = J.Buffer(pA, BM * K * sizeof_bf16)
+    row = J.lane_id % mfma_MN
+    col = J.lane_id // mfma_MN
+    vaddr = J.gpr(row * (K*sizeof_bf16) + col * sizeof_DW4)
+    soff = J.gpr("su32")
+    soff[0] = 0
+    for m in range(num_mfma_m):
+        for k in range(num_mfma_k):
+            buff_a.load_dwordx4(A[m,k], vaddr, soff, offset12=k*mfma_K*sizeof_bf16)
+        soff[0] = soff[0] + mfma_MN * K * sizeof_bf16
+    """
+
+    # 4 warps work in parallel along N dimension
+    buff_b = J.Buffer(pB, N * K * sizeof_bf16)
+    # ping-pong buffer
+    B = J.gpr(2, num_mfma_n, num_mfma_k, 4, "abf16x2")
+    C = J.gpr(2, num_mfma_m, num_mfma_n, 4, "vf32")
+
+    # prelog0, load Bn0
+    # prelog1, load Bn1, compute Cn0
+    # loop:    load Bn2, compute Cn1, store Cn0 to LDS & load Cn0 & store to HBM
+    voff_b = J.gpr(J.lane_id * sizeof_DW4 + J.gpr(J.warp_id * (mfma_MN * K * sizeof_bf16)))
+    soff_b = J.gpr("su32")
+    soff_b[0] = 0
+    def load_next_B(index):
+        for n in range(num_mfma_n):
+            for k in range(num_mfma_k):
+                buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
+                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
+            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
+
+    def load_next_B_gen(index):
+        for n in range(num_mfma_n):
+            for k in range(num_mfma_k):
+                yield buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
+                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
+            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
+
+
+    def mfma_generator(index):
+        for k in range(num_mfma_k):
+            for m in range(num_mfma_m):
+                for n in range(num_mfma_n):
+                    Ci = 0 if k == 0 else C[index,m,n]
+                    yield J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,0:1], A[m,k,0:1], Ci)
+        for k in range(num_mfma_k):
+            for m in range(num_mfma_m):
+                for n in range(num_mfma_n):
+                    yield J.v_mfma_f32_16x16x16_bf16(C[index,m,n], B[index,n,k,2:3], A[m,k,2:3], C[index,m,n])
+
+    mfma_cycles = 16 if mfma_MN == 16 else 32
+    emit_mfma = J.emitter(mfma_cycles)
+    emit_bload = J.emitter(1)
+
+    # prelog0, load Bn0
+    load_next_B(0)
+
+    # prelog1, load Bn1, compute Cn0
+    load_next_B(1)
+    J.s_waitcnt(mod=f"vmcnt({num_mfma_n*num_mfma_k})")
+
+    mfma0 = mfma_generator(0)
+    emit_mfma([mfma0])
+
+    # loop:    load Bn2, compute Cn1, store Cn0 to LDS & load Cn0 & store to HBM
+    s_cvt_bf16_bias = J.gpr("su32")
+    s_cvt_bf16_bias[0] = 0x00008000
+
+    vmem_lane_size = sizeof_DW
+
+    lds_padding = (4 if vmem_lane_size == sizeof_DW else 8) * sizeof_bf16 # to avoid bank-conflict
+    lds_width = num_mfma_n * 4 * mfma_MN * sizeof_bf16
+    lds_stride = lds_width + lds_padding
+    lds = J.alloc_lds((num_mfma_m * mfma_MN) * (lds_stride))
+    #lds = J.alloc_lds(64*1024)
+
+    # WG level write C into LDS
+    row = J.threadIdx.x % mfma_MN
+    col = J.threadIdx.x // mfma_MN
+    voff_c_lds_w = J.gpr(row * lds_stride + col * (4 * sizeof_bf16))
+    def ds_write_C(index):
+        for m in range(num_mfma_m):
+            for n in range(num_mfma_n):
+                offset = lds + m*mfma_MN*lds_stride + n*(4*mfma_MN*sizeof_bf16)
+                # suppose 4 fp32 in C[0:3] was already converted into packed bf16 and stored in C[0:1]
+                J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
+
+    # WG level load C from LDS
+    
+    num_lanes_ldsr = J.div(lds_width, vmem_lane_size)
+    assert num_lanes_ldsr <= 64, num_lanes_ldsr
+    col = J.threadIdx.x % num_lanes_ldsr
+    row = J.threadIdx.x // num_lanes_ldsr
+    num_rows_per_load = J.div(256, num_lanes_ldsr)
+    num_loads = J.div(num_mfma_m * mfma_MN, num_rows_per_load)
+    voff_c_lds_r = J.gpr(row * lds_stride + col * (vmem_lane_size))
+    vmem_stride = N * sizeof_bf16
+    # vaddr_output = J.gpr(v_token_id[m] * vmem_stride + lane_div_16 * (4 * sizeof_bf16) + n * 4 * (4 * sizeof_bf16))
+    #voff_vmem = J.gpr(row * vmem_stride + col * (vmem_lane_size))
+    v_weights = J.gpr(num_mfma_m, 2, "vf32") # pkmul
+    voff_vmem = J.gpr(num_loads, "vu32")
+    for m in range(num_mfma_m):
+        J.ds_read_b32(v_weights[m,0], (m*mfma_MN + (J.lane_id % mfma_MN))*4, mod=f"offset:{lds_weights}")
+    for i in range(num_loads):
+        J.ds_read_b32(voff_vmem[i], row * 4, mod=f"offset:{lds_token_ids + i * num_rows_per_load * 4}")
+        #voff_vmem[i] = 0
+    J.s_waitcnt(mod="lgkmcnt(0)")
+    for m in range(num_mfma_m):
+        v_weights[m,1] = v_weights[m,0]
+
+    #J.debug_log(v_weights[0], torch.float)
+
+    for i in range(num_loads):
+        voff_vmem[i] = voff_vmem[i] * vmem_stride + col * (vmem_lane_size)
+    
+    voff_vmem_row = J.gpr(row)
+
+    temp_c = J.gpr(num_loads, vmem_lane_size//sizeof_DW, "vbf16x2")
+    def ds_load_C():
+        for i in range(num_loads):
+            offset = lds + i * num_rows_per_load * lds_stride
+            J.ds_read_b32(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
+
+    def atomic_pk_add_bf16():
+        for i in range(num_loads):
+            J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC)
+            #J.global_store_dword(voff, temp_c[i], pC)
+        return num_loads
+
+    def cvt_f32_to_pk_bf16(index):
+        for m in range(num_mfma_m):
+            for n in range(num_mfma_n):
+                #J.v_pk_mul_f32(C[index,m,n,0:1], C[index,m,n,0:1], s_weight)
+                #J.v_pk_mul_f32(C[index,m,n,2:3], C[index,m,n,2:3], s_weight)
+                J.v_add_u32(C[index,m,n,0], C[index,m,n,0], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,1], C[index,m,n,1], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,2], C[index,m,n,2], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,3], C[index,m,n,3], s_cvt_bf16_bias)
+                J.pk_f32_to_bf16(C[index,m,n,0], C[index,m,n,0], C[index,m,n,1])
+                J.pk_f32_to_bf16(C[index,m,n,1], C[index,m,n,2], C[index,m,n,3])
+
+    # directly output to vmem
+    vmem_atomic_lane_size = sizeof_DW2
+    row = J.threadIdx.x % mfma_MN
+    col = J.threadIdx.x // mfma_MN
+    vmem_atomic_vaddr = J.gpr(row * vmem_stride + col * (vmem_atomic_lane_size))
+
+    def loop_body(ni):
+        #load_next_B(n&1)
+
+        J.s_waitcnt(mod=f"vmcnt({num_loads})")
+        #J.s_waitcnt(mod=f"vmcnt({0})")
+        mfma1 = mfma_generator((ni+1)&1)
+
+        B_loader = load_next_B_gen(ni&1)
+        
+        #load_next_B(ni&1)
+
+        """
+        index = ni & 1
+        for n in range(num_mfma_n):
+            for k in range(num_mfma_k):
+                buff_b.load_dwordx4(B[index,n,k], voff_b, soff_b)
+                emit_mfma([mfma1], 32)
+                soff_b[0] = soff_b[0] + mfma_MN * mfma_K * sizeof_bf16
+            soff_b[0] = soff_b[0] + (3*num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
+            #soff_b[0] = soff_b[0] + (-num_mfma_k * mfma_MN * mfma_K * sizeof_bf16)
+        """
+        #cvt_f32_to_pk_bf16(n&1)
+        index = ni&1
+        for m in range(num_mfma_m):
+            emit_bload([B_loader], 1)
+            for n in range(num_mfma_n):
+                J.v_pk_mul_f32(C[index,m,n,0:1], C[index,m,n,0:1], v_weights[m])
+                J.v_pk_mul_f32(C[index,m,n,2:3], C[index,m,n,2:3], v_weights[m])
+                J.v_add_u32(C[index,m,n,0], C[index,m,n,0], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,1], C[index,m,n,1], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,2], C[index,m,n,2], s_cvt_bf16_bias)
+                J.v_add_u32(C[index,m,n,3], C[index,m,n,3], s_cvt_bf16_bias)
+                J.pk_f32_to_bf16(C[index,m,n,0], C[index,m,n,0], C[index,m,n,1])
+                J.pk_f32_to_bf16(C[index,m,n,1], C[index,m,n,2], C[index,m,n,3])
+            #emit_mfma([mfma1], 16)
+        #if ni == 0:
+        #    J.debug_log(C[index,0,0,0:1], torch.bfloat16)
+        if 0:
+            for m in range(num_mfma_m):
+                for n in range(num_mfma_n):
+                    offset = m * mfma_MN * vmem_stride + n * (4*mfma_MN * sizeof_bf16)
+                    J.global_atomic_pk_add_bf16(vmem_atomic_vaddr[0] + offset, C[index,m,n,0], pC)
+                    J.global_atomic_pk_add_bf16(vmem_atomic_vaddr[0] + offset + 2*sizeof_bf16, C[index,m,n,1], pC)
+                    emit_mfma([mfma1], 64)
+            vmem_atomic_vaddr[0] = vmem_atomic_vaddr[0] + (4 * num_mfma_n * mfma_MN * sizeof_bf16)
+        else:
+            # ds_write_C(ni&1)
+            index = ni & 1
+            for m in range(num_mfma_m):
+                emit_bload([B_loader], 1)
+                for n in range(num_mfma_n):
+                    offset = lds + m*mfma_MN*lds_stride + n*(4*mfma_MN*sizeof_bf16)
+                    # suppose 4 fp32 in C[0:3] was already converted into packed bf16 and stored in C[0:1]
+                    J.ds_write_b64(voff_c_lds_w, C[index, m, n, 0:1], mod=f"offset:{offset}")
+                    emit_mfma([mfma1], 16)
+            emit_mfma([mfma1], 32)
+            J.s_waitcnt(mod=f"lgkmcnt(0)")
+            J.s_barrier()
+
+            #ds_load_C()
+            for i in range(num_loads):
+                offset = lds + i * num_rows_per_load * lds_stride
+                if vmem_lane_size == sizeof_DW4:
+                    J.ds_read_b128(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
+                else:
+                    assert vmem_lane_size == sizeof_DW
+                    J.ds_read_b32(temp_c[i], voff_c_lds_r, mod=f"offset:{offset}")
+                emit_mfma([mfma1], 32)
+
+            emit_bload([B_loader])
+
+            #atomic_pk_add_bf16()
+            for i in range(num_loads):
+                J.s_waitcnt(mod=f"lgkmcnt({min(15,num_loads - i - 1)})")
+                if vmem_lane_size == sizeof_DW4:
+                    J.global_store_dwordx4(voff_vmem[i], temp_c[i], pC)      # this is fast:  (48us)
+                else:
+                    assert vmem_lane_size == sizeof_DW
+                    # the bigger the M is, the bigger the perf-diff is
+                    #J.global_store_dword(voff, temp_c[i], pC)       # this is slightly slower than directly store  (49us)
+                    with J.ExecMask(i * num_rows_per_load + voff_vmem_row < M[0]):
+                        J.global_atomic_pk_add_bf16(voff_vmem[i], temp_c[i], pC) # this is much slower than directly store      (60us)
+                emit_mfma([mfma1], 32)
+
+
+        emit_mfma([mfma1])
+        pC[:] += (4 * num_mfma_n * mfma_MN * sizeof_bf16)
+        #assert 0, (4 * num_mfma_n * mfma_MN)
+
+    if 1:
+        for n in range(J.div(N, 4 * num_mfma_n * mfma_MN)):
+            loop_body(n)
+        return
+    loop_i = J.gpr("su32")
+    loop_i[0] = 0
+    loop_cnt = J.div(N, 8 * num_mfma_n * mfma_MN)
+    J.s_waitcnt(mod=f"vmcnt(0)")
+    with J.While(loop_i[0] < loop_cnt):
+        loop_body(0)
+        loop_body(1)
+        loop_i[0] = loop_i[0] + 1
+
+    #v_mfma_f32_32x32x16_bf8_bf8
+SS1 = int(os.getenv("SS1", "0"))
+
+@jit(with_debug_log=False)
 def moe_gemm_stage1(J:JIT,
                     weight_dtype,
                     TOPK,
@@ -725,7 +1004,8 @@ def moe_gemm_stage1(J:JIT,
     assert BLOCK_TILE_SIZE_M % 16 == 0
     # to get 4*8bf16(aka dword16) for gemm2, the gemm1 output must be multiple of 64, after gate*up the width will be 32
     assert BLOCK_TILE_SIZE_N % 64 == 0
-    K2 = N1
+
+    K2 = N1//2
 
     sizeof_bf16 = 2
     sizeof_f32 = 4
@@ -757,17 +1037,32 @@ def moe_gemm_stage1(J:JIT,
 
     # hide following initialization into s_waitcnt
     p_sorted_ids[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
+    p_sorted_weights[:] += e_idx * (BLOCK_TILE_SIZE_M * 4)
+
     # one WG per CU,  4 waves split on K
     lane_mod_16 = get_lane_id_mod(J, 16)
     lane_div_16 = get_lane_id_div(J, 16)
     warp_id = J.gpr("su32")
     J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
 
+    lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32)
+    lds_buff_out = lds_buff.view_as([BLOCK_TILE_SIZE_M, 32 // 2], torch.float32)
+
+    lds_weights = J.alloc_lds(256*4)
+    lds_token_ids = J.alloc_lds(256*4)
+
     v_sorted_id = J.gpr(A_vert, 'vu32')
     J.global_load_dword(v_sorted_id[0], lane_mod_16 << 2, p_sorted_ids)
     for n in range(1, A_vert):
-        p_sorted_ids[:] += 16 * 4
+        p_sorted_ids[:] += n * 16 * 4
         J.global_load_dword(v_sorted_id[n], lane_mod_16 << 2, p_sorted_ids)
+
+    # load 256 weights
+    v_sorted_weights = J.gpr('vf32')
+    assert BLOCK_TILE_SIZE_M <= 256
+    with J.ExecMask(J.threadIdx.x < BLOCK_TILE_SIZE_M):
+        J.global_load_dword(v_sorted_weights, J.threadIdx.x * 4, p_sorted_weights)
+
     voffset_b = J.gpr(B_horz, 'vu32')
     voffset_b[0] = J.threadIdx.x * 16
     voffset_b[B_horz // 2] = voffset_b[0] + (N1 // 2 * sizeof_w) * K1
@@ -777,8 +1072,24 @@ def moe_gemm_stage1(J:JIT,
 
     buff_a = J.Buffer(p_input, M * (K1 * sizeof_bf16))
 
+    J.debug_setup((e_idx[0] == 0) & (warp_id[0] == 0))
+
     # wait for v_sorted_id
     J.s_waitcnt(mod=f"vmcnt(0)")
+    #J.debug_log(v_sorted_weights, torch.float)
+    J.ds_write_b32(J.threadIdx.x * 4, v_sorted_weights, mod=f"offset:{lds_weights}")
+    with J.ExecMask(J.threadIdx.x < 16):
+        for m in range(A_vert):  
+            J.ds_write_b32(J.lane_id * 4, v_sorted_id[m] & 0xffffff, mod=f"offset:{lds_token_ids + m*16*4}")
+
+    if 0:
+        J.s_waitcnt(mod=f"lgkmcnt(0)")
+        J.debug_log(v_sorted_weights, torch.float)
+        for i in range(4):
+            vtmp = J.gpr("vu32")
+            J.ds_read_b32(vtmp, J.lane_id * 4, mod=f"offset:{lds_token_ids + i*64*4}")
+            J.debug_log(vtmp, torch.int32)
+
     voffset_a1 = J.gpr(A_vert, 'vu32')
     v_topk_id = J.gpr(A_vert, 'vu32')
     v_token_id = J.gpr(A_vert, 'vu32')
@@ -799,13 +1110,13 @@ def moe_gemm_stage1(J:JIT,
             voffset_scale[B_horz // 2 + m] = voffset_scale[B_horz // 2] + 16 * sizeof_f32 * m
 
     p_w_up[:] += s_e_id * (N1 * K1 * sizeof_w)
+    p_w_down[:] += s_e_id * (N2 * K2 * sizeof_w)
+
     buff_b = J.Buffer(p_w_up, K1 * N1 * sizeof_w)
 
     s_cvt_bf16_bias = J.gpr(1, "su32")
     s_cvt_bf16_bias[0] = 0x00008000
     # split K
-    lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 64], torch.float32)
-    lds_buff_out = lds_buff.view_as([BLOCK_TILE_SIZE_M, 32 // 2], torch.float32)
     # each 32 N as a group to compute gate*up
     n_groups = BLOCK_TILE_SIZE_N // 32
     n_half0 = 0
@@ -813,7 +1124,8 @@ def moe_gemm_stage1(J:JIT,
     # each wave reduce 4 rows once
     vrow = J.gpr(lane_div_16 + warp_id * 4)
 
-    A_reg_gemm2 = J.gpr(N1 // BLOCK_TILE_SIZE_N, n_groups // 2, A_vert, 4, "bf16x2")
+    A_reg_gemm2 = J.gpr(A_vert, (N1 // BLOCK_TILE_SIZE_N) * (n_groups // 2), 4, "bf16x2")
+
     for block_n in range(N1 // BLOCK_TILE_SIZE_N):
         if block_n != 0:
             C_reg[:] = 0
@@ -857,13 +1169,26 @@ def moe_gemm_stage1(J:JIT,
                 J.v_add_u32(out1[0], out1[0], s_cvt_bf16_bias)
                 J.pk_f32_to_bf16(vouts[m], out0[0], out1[0])
                 # to remove, test only
-                # output: [B, TOPK, N]
-                v_token_id = J.gpr(v_sorted_id_permute[0] & 0xffffff)
-                v_topk_id = J.gpr(v_sorted_id_permute[0] >> 24)
-                vaddr = J.gpr(v_token_id * (N1 // 2 * sizeof_bf16 * TOPK) + v_topk_id * (N1 // 2 * sizeof_bf16) + lane_mod_16 * sizeof_f32 + n * 16 * sizeof_f32 + block_n * (BLOCK_TILE_SIZE_N // 2) * sizeof_bf16)
-                with J.ExecMask(v_token_id < M[0]):
-                    J.global_store_dword(vaddr, vouts[m], p_output)
-
+                # 
+                #    output: [B, TOPK, N]
+                #            [B,              TOPK,   N1//BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_N // 64,      16,       2, bfloat16]
+                #            [v_token_id, v_topk_id,        block_n,                        n,         lane_mod_16,  2, bfloat16]
+                #    
+                if SS1 == 0:
+                    v_token_id = J.gpr(v_sorted_id_permute[0] & 0xffffff)
+                    v_topk_id = J.gpr(v_sorted_id_permute[0] >> 24)
+                    vaddr = J.gpr(v_token_id * (N1 // 2 * sizeof_bf16 * TOPK) + \
+                                  v_topk_id * (N1 // 2 * sizeof_bf16) + \
+                                  lane_mod_16 * sizeof_f32 + \
+                                  n * 16 * sizeof_f32 + \
+                                  block_n * (BLOCK_TILE_SIZE_N // 2) * sizeof_bf16)
+                    with J.ExecMask(v_token_id < M[0]):
+                        J.global_store_dword(vaddr, vouts[m], p_output)
+                #if block_n == 0 and n ==0 and m == 0:
+                #    J.debug_log(v_token_id[0], torch.int32)
+                #    J.debug_log(v_topk_id[0], torch.int32)
+                #    J.debug_log(vouts[m], torch.bfloat16)
+            # lds_buff_out = lds_buff.view_as([BLOCK_TILE_SIZE_M, 32 // 2], torch.float32)
             # be sure read done
             J.s_barrier()
             for m in range(A_vert):
@@ -873,7 +1198,7 @@ def moe_gemm_stage1(J:JIT,
             J.s_barrier()
 
             for m in range(A_vert):
-                lds_buff_out.read("b128", A_reg_gemm2[block_n, n, m], lane_mod_16 + m * 16, lane_div_16 * 4)
+                lds_buff_out.read("b128", A_reg_gemm2[m, block_n * (n_groups // 2) + n], lane_mod_16 + m * 16, lane_div_16 * 4)
 
             #J.s_waitcnt(mod=f"lgkmcnt(0)")
             J.s_barrier()
@@ -883,7 +1208,22 @@ def moe_gemm_stage1(J:JIT,
 
     # be sure A_reg_gemm2 ready
     J.s_waitcnt(mod=f"lgkmcnt(0)")
+    J.s_waitcnt(mod=f"vmcnt(0)")
+    # release LDS buffer 
+    del lds_buff
+    #J.debug_log(A_reg_gemm2[0,3], torch.bfloat16)
+    #return
     # TODO: gemm2
+    if not SS1: return
+    num_mfma_n = 2
+    down_kernel(J, 16,
+                num_mfma_n, BLOCK_TILE_SIZE_M, N2, K2,
+                A_reg_gemm2, # A = J.gpr(num_mfma_m, num_mfma_k, 4, "abf16x2")
+                lds_token_ids,  # 256 int32 token_id
+                lds_weights,    # 256 fp32 weights 
+                p_w_down,
+                p_output,
+                M)
 
 #####################################################################
 def run_aiter(hidden_states,
@@ -939,26 +1279,23 @@ def run_batch(B=1, weight_type=torch.bfloat16):
 
     topk_weight = torch.randn([BUF_COPY, B, TOPK], dtype=torch.float32)
     topk_ids = torch.ones([BUF_COPY, B, TOPK], dtype=torch.int32)
-    # make a B*TOPK seq, which contains 0...E-1 0...E-1
-    rep_e = div_up(B * TOPK, E)
-    topk_ids_1d = torch.ones([rep_e, E], dtype=torch.int32)
-    topk_ids_1d[:, ] = torch.randperm(E, dtype=torch.int32)
-    topk_ids[:, ] = topk_ids_1d.reshape(-1)[ : B * TOPK].reshape(B, TOPK)
-    access_expert = torch.unique(topk_ids[0])
-    access_expert = access_expert.shape[0]
+    topk_ids_base = torch.randperm(E, dtype=torch.int32)
 
     if 1:
         import aiter
 
+        topk_ids[0,:,] = topk_ids_base[: TOPK]
         from aiter.ops.shuffle import shuffle_weight
         # aiter needs preshuffle weights
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         ref_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
-        flops = 2 * B * TOPK * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP)
-        mem_size = B * HIDDEN_SIZE * 2 + (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * access_expert * (2 if weight_type == torch.bfloat16 else 1)
+        flops = 2 * B * (HIDDEN_SIZE * INTER_SIZE_TP * 2 + TOPK * HIDDEN_SIZE * INTER_SIZE_TP)
+        mem_size = (HIDDEN_SIZE * INTER_SIZE_TP * 2 + HIDDEN_SIZE * INTER_SIZE_TP) * TOPK * B * (2 if weight_type == torch.bfloat16 else 1)
         for _ in range(10):
+            idx_start = random.randint(0, E - TOPK)
+            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"aiter[{B=},{str(weight_type).split('.')[1]}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
@@ -1062,21 +1399,44 @@ def run_batch(B=1, weight_type=torch.bfloat16):
                         else:
                             if 1:
                                 BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 128
+                                BLOCK_TILE_SIZE_N = 64
+                                # print(f"=================== moe_gemm_stage1 {TOPK=} {K1=} {N1=} {N2=} {BLOCK_TILE_SIZE_M=} {BLOCK_TILE_SIZE_N=} {INTER_SIZE_TP=}")
                                 moe_gemm_stage1([1, sorted_expert_ids.shape[0]], [256],
                                                 w1.dtype, TOPK, K1, N1, N2, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                hidden_states.data_ptr(), w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
-                                                gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
-                                moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
-                                                w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
-                                                gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+                                                hidden_states.data_ptr(),
+                                                w1.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0,
+                                                w2.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0,
+                                                moe_buf.data_ptr() if SS1 else gemm1_out.data_ptr(),
+                                                sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), B)
+                                if 0:
+                                    print("============================================")
+                                    max_valid_M, _ = num_valid_ids.tolist()
+                                    expert = {}
+                                    token_ids = {}
+                                    for blk in range(max_valid_M//BLOCK_TILE_SIZE_M):
+                                        i0 = blk * BLOCK_TILE_SIZE_M
+                                        i1 = i0 + BLOCK_TILE_SIZE_M
+                                        valid_index = (sorted_ids[i0:i1] & ((1<<24) - 1)) < B
+                                        expert = sorted_expert_ids[blk].tolist()
+                                        token_ids = (sorted_ids[i0:i1][valid_index] & ((1<<24) - 1)).tolist()
+                                        token_top = (sorted_ids[i0:i1][valid_index] >> 24).tolist()
+                                        weights = sorted_weights[i0:i1][valid_index].tolist()
+                                        print(f"[{blk}] {expert=} {token_ids=} {token_top=} {weights}")
+                                    print("============================================")
+                                if not SS1:
+                                    #print(gemm1_out[:, 3, :])
+                                    moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
+                                                    w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
+                                                    gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
+                                #print("============================================ moe_buf")
+                                #print(moe_buf[:,316:333])
                             elif 1:
                                 BLOCK_TILE_SIZE_M = BLOCK_M
-                                BLOCK_TILE_SIZE_N = 128
+                                BLOCK_TILE_SIZE_N = 64
                                 moe_gemm_batch_vmn([N1 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [256],
                                                 w1.dtype, TOPK, K1, N1, True, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 hidden_states.data_ptr(), w1.data_ptr(), gemm1_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w1_scale.data_ptr() if w1_scale is not None else 0, B)
-                                BLOCK_TILE_SIZE_N = 128
+                                BLOCK_TILE_SIZE_N = 64
                                 moe_gemm_batch_vmn([N2 // BLOCK_TILE_SIZE_N, sorted_expert_ids.shape[0]], [64],
                                                 w1.dtype, TOPK, K2, N2, False, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N,
                                                 gemm1_out.data_ptr(), w2.data_ptr(), moe_buf.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B)
@@ -1119,11 +1479,14 @@ def run_batch(B=1, weight_type=torch.bfloat16):
         org_fused_moe = aiter.fused_moe.fused_moe
         aiter.fused_moe.fused_moe = my_fused_moe
 
+        topk_ids[0,:,] = topk_ids_base[: TOPK]
         w1_qt_aiter = shuffle_weight(w1[0], layout=(16, 16))
         w2_qt_aiter = shuffle_weight(w2[0], layout=(16, 16))
         cur_out = run_aiter(hidden_states=hidden_states[0], w1=w1_qt_aiter, w2=w2_qt_aiter, topk_weight=topk_weight[0], topk_ids=topk_ids[0], w1_scale=w1_scale[0], w2_scale=w2_scale[0])
         i = 0
         for _ in range(10):
+            idx_start = random.randint(0, E - TOPK)
+            topk_ids[i,:,] = topk_ids_base[idx_start : idx_start + TOPK]
             with cudaPerf(flops, mem_size, name=f"cur[{B=},{str(weight_type).split('.')[1]}]"):
                 run_aiter(hidden_states=hidden_states[i], w1=w1[i], w2=w2[i], topk_weight=topk_weight[i], topk_ids=topk_ids[i], w1_scale=w1_scale[i], w2_scale=w2_scale[i])
             i = (i + 1) % BUF_COPY
@@ -1140,13 +1503,14 @@ def run_batch(B=1, weight_type=torch.bfloat16):
             print("acc OK")
 
 def test():
-    torch.cuda.set_device(2)
+    torch.cuda.set_device(0)
     torch.set_default_device('cuda')
     torch.manual_seed(0)
-    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=8, )
+    torch.set_printoptions(linewidth=3000, sci_mode=False, edgeitems=64, )
     start = 1
     end = 64
-    run_batch(B=8192, weight_type=torch.bfloat16)
+    run_batch(B=3, weight_type=torch.bfloat16)
+    return
     # run_batch(B=1, weight_type=torch.float8_e4m3fnuz)
     for i in range(start-1, end):
         run_batch(B=i + 1, weight_type=torch.bfloat16)

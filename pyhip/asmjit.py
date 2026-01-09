@@ -650,6 +650,7 @@ class LDSTensor:
 
         # mapping const part to offset
         if offset1 is not None:
+            assert self.lds_base == 0, f"offset1 form has limited range, needs {self.lds_base=} to be zero"
             if const_terms < 0:
                 offset0 = 0
                 cur_expr = cur_expr + const_terms
@@ -676,7 +677,8 @@ class LDSTensor:
                 else:
                     offset0 = 0
                     cur_expr = cur_expr + const_terms
-            assert offset0 >= 0 and offset0 < 64*1024
+            offset0 += self.lds_base
+            assert offset0 >= 0 and offset0 < 160*1024
             mod = f"offset:{offset0}"
             tag2 = ""
 
@@ -1630,7 +1632,7 @@ class JIT:
                     n_max = 2**32-1
                     min_k = find_min_k(d, n_max)
                     ceil_sd = (2**min_k + d - 1)//d
-                    assert ceil_sd < 2**32
+                    assert ceil_sd < 2**32, f"{d=} {min_k=} {ceil_sd=}"
                     Instruction(bb, f"s_mul_hi_u32", loc=loc)(dst_expr, src0_operand, ceil_sd)
                     Instruction(bb, f"s_lshr_b32", loc=loc)(dst_expr, dst_expr, min_k-32)
                 else:
@@ -1940,6 +1942,7 @@ class JIT:
                 if len(args) >= 1:
                     name = args[0].strip()
         # gprs
+        gprs = gprs[...]
         if isinstance(gprs, GPRExpr):
             self.op == "getitem"
             rtype = gprs.src0.rtype
@@ -2086,6 +2089,9 @@ class JIT:
             cnt += 1
         return ret
 
+    def is_gpr(self, op):
+        return isinstance(op, GPRs) or isinstance(op, GPRExpr)
+
     def pass_hide_dependency(self):
         # hide dependency between address calculation & ds_read/ds_write/global_load
         # by reorder instructions following the mem-access
@@ -2109,7 +2115,7 @@ class JIT:
                         if i + 1 >= len(bb.instructions):
                             break
                         next = bb.instructions[i + 1]
-                        if next.opcode.startswith("v_") and (not next.operands[0].overlap(vaddr)):
+                        if next.opcode.startswith("v_") and self.is_gpr(next.operands[0]) and (not next.operands[0].overlap(vaddr)):
                             bb.instructions[i], bb.instructions[i+1] = next, cur
                             i = i + 1
                             swap_cnt += 1
@@ -2953,6 +2959,11 @@ class jit_kernel:
                 J.debug_log_ptr = J.new_gpr('s',2, dtype="u32", align=2, name="debug_log_ptr")
                 J.s_load_dwordx2(J.debug_log_ptr, J.kargs, arg_offset)
                 arg_offset += 8
+
+            # initialize warp_id/lane_id vgpr here to prevent ExecMask issue
+            # (dce will remove them if no one use it)
+            J.warp_id
+            J.lane_id
 
             if arg_offset > 0:
                 J.s_waitcnt(mod=f"lgkmcnt(0)")
