@@ -1,0 +1,243 @@
+from pyhip import cudaPerf, jit, JIT
+import torch
+
+def div_up(x, y):
+    return (x + y - 1) // y
+
+# TODO: refine gemm interface
+def gemm_splitk(J:JIT,
+                weight_dtype,
+                K,
+                N,
+                num_split_k,
+                buff_a,
+                buff_b,
+                p_w_scale,
+                voffset_a,
+                voffset_b,
+                voffset_scale,
+                C_reg,
+                soffset_a = 0,
+                soffset_b = 0,
+                BLOCK_TILE_SIZE_N = 32,
+                BLOCK_TILE_SIZE_M = 16,
+                USE_FP4_SHUFFLE_WEIGHT=False
+                ):
+    assert BLOCK_TILE_SIZE_M % 16 == 0, f'BLOCK_TILE_SIZE_M must be multiple of 16, current {BLOCK_TILE_SIZE_M=}'
+    assert BLOCK_TILE_SIZE_N % 32 == 0, f'BLOCK_TILE_SIZE_N must be multiple of 32, current {BLOCK_TILE_SIZE_N=}'
+    sizeof_f32 = 4
+    sizeof_bf16 = 2
+    sizeof_w = sizeof_bf16 if weight_dtype == torch.bfloat16 else 1
+    # 16 elements for a if fp8
+    if weight_dtype == torch.bfloat16:
+        a_element_num_per_thread = 8
+    elif weight_dtype == torch.float4_e2m1fn_x2:
+        a_element_num_per_thread = 32
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        a_element_num_per_thread = 16
+    else:
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
+
+    soffset_kb = J.gpr("su32")
+    soffset_ka = J.gpr("su32")
+    soffset_kb[0] = soffset_b
+    soffset_ka[0] = soffset_a
+
+    # num block in A vert direction
+    A_vert = BLOCK_TILE_SIZE_M // 16
+    # num block in B horz direction
+    B_horz = BLOCK_TILE_SIZE_N // 16
+    if weight_dtype == torch.bfloat16:
+        A_rep = 1
+    # there is 16 elements per weight read if fp8, so A should be double read
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        A_rep = 2
+    elif weight_dtype == torch.float4_e2m1fn_x2:
+        A_rep = 4
+    else:
+        raise ValueError(f"Unsupported weight dtype: {weight_dtype}")
+    # A_reg layout:
+    # pinpong  index for vert direction                 index for different mem read(x16bytes)   index for different mfma   minimal for one mfma
+    # pinpong  dword4x[?]                               dword4[?]                                dword2[?]                  dword[?](for mfma)
+    A_reg = J.gpr(2, A_vert, A_rep, 2, 2, "abf16x2") # 8-bf16 == DWORDx4
+    # B_reg layout:
+    # bf16: pinpong  n(diff N)/index for different mem read(x16bytes)  index for different mfma  minimal for one mfma
+    # fp8:  ..       ..                                                ..                        index for different mfma
+    B_reg = J.gpr(2, B_horz, 2, 2, "vbf16x2") # 8-bf16 == DWORDx4
+
+    if weight_dtype == torch.float4_e2m1fn_x2:
+        # the column of scale is K//32
+        k_scale_n = div_up(div_up(K, 32), 8) // num_split_k
+        v_w_scale = J.gpr(B_horz // 2, k_scale_n, 'vf32', align=4)
+        k_scale_n_next_read_idx = 0
+    elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        v_w_scale = J.gpr(B_horz, 2, 'vf32')
+        for n in range(B_horz):
+            J.global_load_dword(v_w_scale[n, 0], voffset_scale[n], p_w_scale)
+
+    # ping pong register buffer id
+    pp_reg_id = 0
+    k_step_wg = num_split_k * 32 * A_rep
+
+    # (A0.B0.C0.D0.A1.B1.C1.D1)[3, 2, 7, 6] = (A1.B1.A0.B0)
+    pattern_cvt_bf16 = J.gpr("su32")
+    pattern_cvt_bf16[0] = 0x03_02_07_06
+    k_max = div_up(K, k_step_wg)
+    s_cvt_bf16_bias = J.gpr(1, "su32")
+    s_cvt_bf16_bias[0] = 0x00008000
+
+    def load_gen(pp_reg_id, k=None):
+        k_scale_wip = 0
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            nonlocal k_scale_n_next_read_idx
+            if k % 2 == 0 and k_scale_n_next_read_idx < k_scale_n:
+                for n in range(B_horz // 2):
+                    # prefetch next scale
+                    J.global_load_dword(v_w_scale[n, k_scale_n_next_read_idx], voffset_scale[n], p_w_scale, mod=f'offset:{k_scale_n_next_read_idx * 64 * sizeof_f32}')
+                k_scale_n_next_read_idx += 1
+                k_scale_wip = B_horz // 2
+        for m in range(A_vert):
+            buff_a.load_dwordx4(A_reg[pp_reg_id, m, 0], voffset_a[m], soffset_ka)
+            if weight_dtype != torch.bfloat16:
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 1], voffset_a[m], soffset_ka, offset12=16)
+            if weight_dtype == torch.float4_e2m1fn_x2:
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 2], voffset_a[m], soffset_ka, offset12=32)
+                yield buff_a.load_dwordx4(A_reg[pp_reg_id, m, 3], voffset_a[m], soffset_ka, offset12=48)
+        for n in range(B_horz):
+            yield buff_b.load_dwordx4(B_reg[pp_reg_id, n], voffset_b[n], soffset_kb)
+
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            if USE_FP4_SHUFFLE_WEIGHT:
+                soffset_kb[0] = soffset_kb[0] + 64 * 16
+            else:
+                soffset_kb[0] = soffset_kb[0] + 64
+            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * sizeof_bf16
+        else:
+            soffset_kb[0] = soffset_kb[0] + 16 * 64 * num_split_k
+            soffset_ka[0] = soffset_ka[0] + a_element_num_per_thread * 4 * num_split_k * sizeof_bf16
+        J.s_waitcnt(mod=f"vmcnt({B_horz + A_vert * A_rep + k_scale_wip})")
+    
+    def mfma_gen(pp_reg_id, k=None):
+        if weight_dtype == torch.float4_e2m1fn_x2:
+            # decompress
+            v_w_bf16 = J.gpr(2, 4, 'vf32', align=4)
+            pos_in_scale = (k & 1) * 16
+            v_w_scale_f32 = J.gpr(2, 'vu32')
+            def delayed_fma():
+                for n in range(B_horz):
+                    for i in range(2):
+                        for j in range(2):
+                            for m in range(A_vert):
+                                yield J.v_mfma_f32_16x16x32_bf16(C_reg[n, m], v_w_bf16[j], A_reg[pp_reg_id, m, i * 2 + j], C_reg[n, m])
+
+            is_first_fma = True
+            gen = delayed_fma()
+            for n in range(B_horz):
+                if n % 2 == 0:
+                    J.v_bfe_u32(v_w_scale_f32[0], v_w_scale[n // 2, k // 2], pos_in_scale, 8)
+                    J.v_bfe_u32(v_w_scale_f32[1], v_w_scale[n // 2, k // 2], pos_in_scale + 8, 8)
+                    v_w_scale_f32[0] = v_w_scale_f32[0] << 23
+                    v_w_scale_f32[1] = v_w_scale_f32[1] << 23
+                for i in range(2):
+                    for j in range(2):
+                        # https://github.com/vosen/llvm-project/blob/f83ee1070d25768518391cbfee1b4412179a5b0a/llvm/test/CodeGen/AMDGPU/llvm.amdgcn.cvt.scalef32.pk.gfx950.ll#L840
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 0], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[0,0,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 1], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[1,0,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 2], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[0,1,0]')
+                        J.v_cvt_scalef32_pk_bf16_fp4(v_w_bf16[j, 3], B_reg[pp_reg_id, n, i, j], v_w_scale_f32[n & 1], mod='op_sel:[1,1,0]')
+                        if is_first_fma:
+                            is_first_fma = False
+                        else:
+                            next(gen)
+            next(gen)
+            
+        elif weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+            # decompress
+            v_w_f32 = J.gpr(2, 2, 'vf32', align=4)
+            v_w_bf16 = J.gpr(B_horz, 2, 'vf32', align=4)
+            for i in range(2):
+                for j in range(2):
+                    for n in range(B_horz):
+                        J.v_cvt_pk_f32_fp8(v_w_f32[0], B_reg[pp_reg_id, n, i, j])
+                        J.v_cvt_pk_f32_fp8_sdwa(v_w_f32[1], B_reg[pp_reg_id, n, i, j], mod='src0_sel:WORD_1')
+                        J.v_pk_mul_f32(v_w_f32[0], v_w_f32[0], v_w_scale[n])
+                        J.v_pk_mul_f32(v_w_f32[1], v_w_f32[1], v_w_scale[n])
+                        J.v_add_u32(v_w_f32[0, 0], v_w_f32[0, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[0, 1], v_w_f32[0, 1], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[1, 0], v_w_f32[1, 0], s_cvt_bf16_bias)
+                        J.v_add_u32(v_w_f32[1, 1], v_w_f32[1, 1], s_cvt_bf16_bias)
+                        J.v_perm_b32(v_w_bf16[n, 0], v_w_f32[0, 0], v_w_f32[0, 1], pattern_cvt_bf16)
+                        J.v_perm_b32(v_w_bf16[n, 1], v_w_f32[1, 0], v_w_f32[1, 1], pattern_cvt_bf16)
+                    # 2, A_vert, A_rep=2, 2, 2
+                    for n in range(B_horz):
+                        for m in range(A_vert):
+                            yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], v_w_bf16[n], A_reg[pp_reg_id, m, i, j], C_reg[n, m])
+        else:
+            for m in range(A_vert):
+                for n in range(B_horz):
+                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 0], A_reg[pp_reg_id, m, 0, 0], C_reg[n, m])
+                    yield J.v_mfma_f32_16x16x16_bf16(C_reg[n, m], B_reg[pp_reg_id, n, 1], A_reg[pp_reg_id, m, 0, 1], C_reg[n, m])
+
+    def loop(pp_reg_id, k=None):
+        loader = load_gen(pp_reg_id, k)
+        mfma = mfma_gen(1 - pp_reg_id, k)
+
+        J.emitter()([loader])
+
+        J.emitter()([mfma])
+
+    # prolog
+    loader = load_gen(0, 0)
+    J.emitter()([loader])
+    if weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz:
+        for n in range(B_horz):
+            J.v_mov_b32(v_w_scale[n, 1], v_w_scale[n, 0])
+    pp_reg_id = 1
+
+    def tail(pp_reg_id, k=None):
+        J.s_waitcnt(mod=f"vmcnt(0)")
+        if isinstance(K, int) and K % k_step_wg:
+            assert K % k_step_wg % (8 * A_rep) == 0, f'K tail must be multiple of {8 * A_rep}, current K={K}, k_step_wg={k_step_wg}'
+            with J.ExecMask(J.lane_id // 16 >= K % k_step_wg / (8 * A_rep), early_skip=False):
+                for m in range(A_vert):
+                    for r in range(A_rep):
+                            A_reg[pp_reg_id, m, r] = 0
+        mfma = mfma_gen(pp_reg_id, k)
+        J.emitter()([mfma])
+
+    if isinstance(K, int):
+        if weight_dtype == torch.bfloat16:
+            assert K % (num_split_k * 32) == 0, f'K must be multiple of {num_split_k * 32}'
+        else:
+            # a wave needs at least 64 elements
+            assert K % 64 == 0, 'K must be multiple of 64'
+    
+        for k in range(0, k_max - 1):
+            loop(pp_reg_id, k)
+            pp_reg_id ^= 1
+
+        # tail
+        tail(1 - pp_reg_id, k_max - 1)
+
+    else:
+        cur_k = J.gpr("si32")
+        cur_k[0] = 0
+        # at least 2 blocks, TODO: add check?
+        k_loop_cnt = K // k_step_wg - 2
+
+        # unroll 2 times for pin/pong buffer, align #loop to even
+        with J.While(cur_k[0] < k_loop_cnt):
+            loop(1)
+            loop(0)
+            cur_k[0] += 2
+        J.Jump("odd_k_block", cur_k[0] == k_loop_cnt + 1)
+        # there are 2 blocks left
+        loop(1)
+        # tail
+        tail(1)
+        J.Jump("k_block_end")
+        # 1 block + tail
+        J.Label("odd_k_block")
+        # tail
+        tail(0)
+        J.Label("k_block_end")

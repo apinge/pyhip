@@ -2,7 +2,7 @@ from functools import cache
 from typing import List, Optional, Set, Union
 
 import filelock
-from .hiptools import module
+from .hiptools import module, amdgpu_arch
 import inspect
 import os
 from contextlib import contextmanager
@@ -12,6 +12,8 @@ from .mem_allocator import SimpleMemoryAllocator
 
 import hashlib
 import subprocess
+
+import types
 
 def get_caller_loc():
     frame = inspect.currentframe().f_back.f_back
@@ -30,6 +32,59 @@ def get_git_revision_hash() -> str:
         print(f'warning: get git revision error: {e}')
         return 'unknown'
 
+@cache
+def _utils_dst_operand_id(opcode, mod):
+    if opcode.startswith("buffer_load_") and "lds" in mod:
+        return -1
+    if opcode.startswith("ds_write") or \
+        opcode.startswith("global_store") or \
+        opcode.startswith("global_load_lds_") or \
+        opcode.startswith("flat_store_") or \
+        opcode.startswith("scratch_load_lds_") or \
+        opcode.startswith("buffer_store_"):
+        return -1
+    return 0
+
+@cache
+def _utils_is_trans_op(opcode):
+    return opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
+
+@cache
+def _utils_is_simple_operand0_store(opcode, mod):
+    '''
+      simple operand0_store :
+        - operands[0] is the only state-change of this instruction
+        - no other side-effect other than store to 1st op
+    '''
+    if opcode.startswith("s_load_"):
+        return True
+    elif opcode.startswith("s_scratch_load_"):
+        return True
+    elif opcode.startswith("s_buffer_load"):
+        return True
+    elif opcode.startswith("ds_read"):
+        return True
+    elif opcode.startswith("flat_load_"):
+        return True
+    elif opcode.startswith("global_load_") and (not opcode.startswith("global_load_lds_")):
+        return True
+    elif opcode.startswith("tbuffer_load_"):
+        return True
+    elif opcode.startswith("buffer_load_") and ("lds" not in mod):
+        return True
+    elif opcode.startswith("scratch_load_") and (not opcode.startswith("scratch_load_lds_")):
+        return True
+    elif opcode.startswith("ds_swizzle_"):
+        return True
+    elif opcode.startswith("ds_permute_") or opcode.startswith("ds_bpermute_"):
+        return True
+    elif opcode.startswith("ds_consume"):
+        return True
+    elif opcode.startswith("ds_") and ("_rtn_" in opcode):
+        return True
+
+    return False
+
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
     def __init__(self, parent_bb:'BasicBlock', opcode, loc=""):
@@ -44,7 +99,7 @@ class Instruction:
         self.loc = loc
 
     def __call__(self, *operands, mod:str="", insert_bb_pos = None):
-        self.operands = list(operands)
+        self.operands = []
         self.mod = mod
         jit = self.parent_bb.jit
         for i, op in enumerate(operands):
@@ -52,25 +107,37 @@ class Instruction:
             if isinstance(op, GPRExpr) and op.op != "getitem":
                 rtype = op.find_rtype()
                 dtype = op.find_dtype()
-                dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="idst")
                 dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
                 jit.recursive_expr_gen(self.parent_bb, dst_expr, op, loc=self.loc)
-                self.operands[i] = dst_expr
+                self.operands.append(dst_expr)
+                continue
+
+            # canonicalize GPR operand into GPRExpr
+            if isinstance(op, GPRs):
+                op = op.to_expr()
 
             assert isinstance(op, GPRExpr) or \
                    isinstance(op, int) or isinstance(op, float) or \
                    (isinstance(op, str) and (op in ["scc", "vcc", "exec", "off", "execz", "m0"])) or \
-                   (isinstance(op, str) and op.startswith("0x")) or \
-                   isinstance(op, GPRs), \
-            f"arg {i} : {type(op)} {op}"
+                   (isinstance(op, str) and op.startswith("0x")), f"arg {i} : {type(op)} {op}"
+
+            self.operands.append(op)
+
         self.parent_bb.add_instruction(self, insert_bb_pos)
         return self
 
     def isVALU(self):
         return self.opcode.startswith("v_")
 
+    def dst_operand_id(self):
+        return _utils_dst_operand_id(self.opcode, self.mod)
+
+    def is_simple_operand0_store(self):
+        return _utils_is_simple_operand0_store(self.opcode, self.mod)
+
     def isTransOp(self):
-        return self.opcode[:6] in ["v_exp_","v_log_","v_rcp_","v_rsq_","v_sqrt","v_sin_","v_cos_"]
+        return _utils_is_trans_op(self.opcode)
 
     def op_repr(self, op):
         if isinstance(op, str):
@@ -285,15 +352,11 @@ class GPRExpr:
         else:
             return f"{self.op}({self.src0},{self.src1},{self.src2})"
 
-# a continous region of GPRs allocated
-# to reference GPR in it, we need getitem:
-#   v[0:1]
-#   v[2]
-# we cann't use v2 as pure-asm does
-# GPRs should be allocated by JIT
+# a logical continous region of GPRs allocated
+# may not physically continous
 class GPRs:
-    patterns = None
-    def __init__(self, jit, rtype, start_id, count, dtype, align=0, name=""):
+
+    def __init__(self, jit, rtype, start_id, count, dtype, align=0, name="", is_fixed=False):
         self.jit = jit
         self.rtype = rtype
         self.start_id = start_id
@@ -301,6 +364,7 @@ class GPRs:
         self.align = align
         self.dtype = dtype
         self.name = name # for debugging purpose only
+        self.is_fixed = is_fixed
         self.set_shape([count]) # default shape: 1D
 
     def set_shape(self, shape):
@@ -383,10 +447,7 @@ class GPRs:
     GPRs will convert self into a GPRExpr before compose expression
     '''
     def to_expr(self):
-        if self.count == 1:
-            return self[0]
-        else:
-            return self[0:(self.count - 1)]
+        return self[...]
 
     def __add__(self, other):
         return GPRExpr("+", self.to_expr(), other)
@@ -551,6 +612,8 @@ class Buffer:
         if offset12 > 0:
             assert offset12.bit_length() <= 12
             mod += f" offset:{offset12}"
+        if vdst is None:
+            return self.J.buffer_load_dwordx4(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dwordx4(vdst, voffset, self.desc, soffset, mod=mod)
 
     def load_dwordx2(self, vdst, voffset, soffset, offset12=0):
@@ -567,6 +630,8 @@ class Buffer:
         mod = f"offen"
         if offset12 > 0:
             mod += f" offset:{offset12}"
+        if vdst is None:
+            return self.J.buffer_load_dword(voffset, self.desc, soffset, mod = mod + " lds")
         return self.J.buffer_load_dword(vdst, voffset, self.desc, soffset, mod=mod)
 
     def store_dwordx4(self, vdata, voffset, soffset, offset12=0):
@@ -576,6 +641,14 @@ class Buffer:
         if offset12 > 0:
             mod += f" offset:{offset12}"
         return self.J.buffer_store_dwordx4(vdata, voffset, self.desc, soffset, mod=mod)
+
+    def store_dwordx2(self, vdata, voffset, soffset, offset12=0):
+        # vdata,    vaddr,        srsrc,  soffset          idxen offen offset12 sc0 nt sc1
+        assert isinstance(offset12 , int) # must be compile time constant
+        mod = f"offen"
+        if offset12 > 0:
+            mod += f" offset:{offset12}"
+        return self.J.buffer_store_dwordx2(vdata, voffset, self.desc, soffset, mod=mod)
 
     def load_dword_lds(self, voffset, soffset, offset12=0):
         mod = f"offen"
@@ -610,9 +683,18 @@ class LDSTensor:
             self.lds_base = lds_base
             self.own = False
 
+    # Python do not guarantee `__del__` happens immediatly at `del obj`
+    # it may delay which is not intended. call free instead
+    """
     def __del__(self):
         if self.own:
             self.J.free_lds(self.lds_base)
+            self.own = False
+    """
+    def free(self):
+        if self.own:
+            self.J.free_lds(self.lds_base)
+            self.own = False
 
     def read(self, dtype:str, vdst, *coord_exprs, offset1=None):
         self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
@@ -704,14 +786,27 @@ PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
+PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
+PYHIP_NOPASS = os.getenv("PYHIP_NOPASS", "").split(":")
 
 if len(PYHIP_DUMP_DIR):
     # remove temp-cache to force recompile once 
-    os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
+    PYHIP_RECOMPILE = 1
     os.makedirs(PYHIP_DUMP_DIR, exist_ok=True)
 
+if PYHIP_RECOMPILE:
+    os.system(f'rm -rf {PYHIP_CACHE_DIR}/*')
+
+_arch_lds_size = {
+    "gfx950": 160*1024
+}
 class JIT:
-    def __init__(self, kernel_tag = ""):
+    def __init__(self, kernel_tag = "", no_pass = None):
+        self.arch = amdgpu_arch()
+        assert self.arch.startswith("gfx")
+        self.gfx = int(self.arch[3:])
+
+        self.no_pass = PYHIP_NOPASS if no_pass is None else no_pass
         self.blocks = []
         # increased freely
         self.free_gpr_id = {'s':0, 'v':0, 'a': 0}
@@ -723,9 +818,69 @@ class JIT:
         self.mark_idx = 0
         self.debug_cond_sgpr = None
         self.debug_log_ptr = None
-        self.lds_allocator = SimpleMemoryAllocator(160*1024)
+        self.lds_allocator = SimpleMemoryAllocator(_arch_lds_size.get(self.arch, 64*1024))
         self.special_vars = {}
         self.kernel_tag = kernel_tag
+        # sizeof mnemonics
+        self.sizeof_fp32 = 4
+        self.sizeof_DW = 4
+        self.sizeof_DW2 = 8
+        self.sizeof_DW4 = 16
+        self.sizeof_fp32 = 4
+        self.sizeof_bf16 = 2
+        self.sizeof_fp16 = 2
+        self.sizeof_fp8 = 1
+        self.sizeof_bf8 = 1
+        # allows J.sizeof(dtype), dtype can be string or torch dtype
+        self._sizeof = {
+            "dw4" : 16,
+            "dwx4" : 16,
+            "DW4" : 16,
+            "DWx4" : 16,
+            "dwordx4":16,
+            "DWORDx4":16,
+
+            "f32" : 4,
+            "fp32" : 4,
+            "float" : 4,
+            "int" : 4,
+            "uint" : 4,
+            "DWORD" : 4,
+            "DW" : 4,
+            "s32": 4,
+            "u32": 4,
+
+            "bf16" : 2,
+            "bfloat16":2,
+            "fp16":2,
+            "float16":2,
+            "half":2,
+            "f16":2,
+            "s16": 2,
+            "u16": 2,
+
+            "s8": 1,
+            "u8": 1,
+
+            # https://rocm.docs.amd.com/projects/HIP/en/latest/reference/low_fp_types.html
+            "fp8" : 1,
+            "bf8" : 1,
+            # CDNA4/gfx950 : FP8-OCP (Open Compute Project)
+            # https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-0-2023-12-01-pdf-1
+            #   torch.float8_e4m3fn:1,
+            #   torch.float8_e5m2:1,
+            # CDNA3/gfx940 : FP8-FNUZ (Finite and NaN Only, no Inf support)
+            #  there is a 2 scaling factor between :
+            #    fp8/float8_e4m3fnuz & bf8/float8_e5m2fnuz
+            # torch.float8_e4m3fnuz:1,
+            # torch.float8_e5m2fnuz:1,
+        }
+
+    def sizeof(self, dtype):
+        if isinstance(dtype ,str):
+            return self._sizeof[dtype]
+        # assume it's torch dype
+        return dtype.itemsize
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -771,6 +926,11 @@ class JIT:
                 return True
         return False
 
+    def is_no_pass(self, *args, **kwargs):
+        if len(self.no_pass) == 0: return
+        caller_name = inspect.currentframe().f_back.f_code.co_name
+        return caller_name in self.no_pass
+
     def Buffer(self, sgpr_base, sgpr_size):
         buff = Buffer(self)
         buff.setup(sgpr_base, sgpr_size)
@@ -785,7 +945,7 @@ class JIT:
             # generate expression into scc
         else:
             dtype = cond.find_dtype()
-            dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="")
+            dst_gprs = self.new_gpr("s", 1, dtype=dtype, align=1, name="Jump_cond")
             dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
             self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
             # optimize 
@@ -851,7 +1011,7 @@ class JIT:
         if isinstance(dst, GPRs):
             rtype = dst.rtype
         dtype = cond.find_dtype()
-        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1)
+        dst_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="SetMask_dst")
         dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
         self.recursive_expr_gen(self.current_bb, dst_expr, cond, loc=get_caller_loc())
         last_inst = self.current_bb.instructions[-1]
@@ -895,7 +1055,7 @@ class JIT:
     Use this to set exec-mask to handle the tail/vari-SIMD-length problem
     '''
     @contextmanager
-    def ExecMask(self, cond:GPRExpr = None):
+    def ExecMask(self, cond:GPRExpr = None, early_skip = True):
         current_frame = inspect.currentframe()
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
@@ -904,65 +1064,16 @@ class JIT:
         self.mark_idx += 1
         
         self.SetMask("vcc", cond)
-        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
+        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2, name="ExecMask_exec_backup")
         self.s_and_saveexec_b64(exec_backup, "vcc") # scc = (exec!=0)
-        self.s_cbranch_execz(mod=label_end) # early skip
+        if early_skip: self.s_cbranch_execz(mod=label_end) # early skip
         try:
             yield # the body of computation with ExecMask
         finally:
-            self.Label(label_end)
+            if early_skip: 
+                self.Label(label_end)
             self.s_mov_b64("exec", exec_backup)
             # if we want to do something when execz happens, we can use scc0
-
-    '''
-    SIMT while: just a prototype with bugs, do not use
-    '''
-    @contextmanager
-    def SIMTWhile(self, cond:GPRExpr = None):
-        current_frame = inspect.currentframe()
-        caller_frame = current_frame.f_back.f_back
-        lineno = caller_frame.f_lineno
-        label_begin = f"_simtwhile_begin_{lineno}_{self.mark_idx}"
-        label_end = f"_simtwhile_end_{lineno}_{self.mark_idx}"
-        self.mark_idx += 1
-        exec_backup = self.new_gpr("s", 2, dtype="i32", align=2)
-        # exec_stopped = self.new_gpr("s", 2, dtype="i32", align=2)
-
-        # generate expression into vcc
-        dtype = cond.find_dtype()
-        def generate_not_cond_in_vcc():
-            dst_gprs = self.new_gpr("v", 1, dtype=dtype, align=1)
-            dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
-            self.recursive_expr_gen(self.current_bb, dst_expr, cond)
-            last_inst = self.current_bb.instructions[-1]
-            if last_inst.opcode == "v_cndmask_b32_e64" and \
-                last_inst.operands[0] is dst_expr and \
-                last_inst.operands[1] == 0 and \
-                last_inst.operands[1] == 1 and \
-                last_inst.operands[1] == "vcc" :
-                self.log("v_cndmask_b32_e64 dst,0,1,vcc is optimized")
-                self.current_bb.instructions.pop()
-                # above code generate condition to keep alive
-                # we need vcc[lane]=1 when cond is false
-                self.s_not_b64("vcc","vcc")
-            else:
-                self.v_cmp_eq_u32_e64("vcc", 0, dst_gprs)
-
-        generate_not_cond_in_vcc()
-        # backup exec, set exec-mask based on vcc
-        self.s_and_saveexec_b64(exec_backup, "vcc")
-        # jump to end if no lanes are alive
-        self.s_cbranch_execz(mod=label_end)
-        self.Label(label_begin)
-        try:
-            # following dict is for loop body code to continue or break
-            yield {"begin":label_begin, "end":label_end}
-        finally:
-            generate_not_cond_in_vcc()
-            self.s_andn2_b64("exec", "exec", "vcc")
-            self.s_cbranch_execnz(mod=label_begin)
-            self.Label(label_end)
-            self.s_or_b64("exec", "exec", exec_backup)
 
     def _align_up(self, a, align):
         return ((a + align - 1)//align) * align
@@ -990,14 +1101,17 @@ class JIT:
     a[2,0,0:3] : referencing gpr groups (continous, no more than instruction needed)
     a[2,0]     : same as above
     a[2]       : referencing
+
+    a = J.gpr("vu32", 0)    : alloc 1 vgpr and set initial value to 0
+    a = J.gpr(4, "af32", 0) : alloc 4 agpr and set initial value to 0
+    a = J.gpr(4, "af32", 0, 3) : alloc 4 agpr and set initial value to 0,3,3,3
     '''
     def gpr(self, *desc, align=0, name=""):
         if name == "":
             # try to reover python var's name from code_context
-            stack = inspect.stack()
-            caller_frame = stack[1]
-            if caller_frame.code_context:
-                src_line = caller_frame.code_context[0].strip()
+            code_context = inspect.getframeinfo(inspect.currentframe().f_back).code_context
+            if code_context:
+                src_line = code_context[0].strip()
                 if "=" in src_line:
                     items = src_line.split("=")
                     if len(items) > 1:
@@ -1008,16 +1122,24 @@ class JIT:
             return self.auto_gpr(desc[0], name=name, loc=get_caller_loc())
 
         # allocate GPRs
-        dtype = desc[-1]
-        assert isinstance(dtype, str), f"{dtype=}"
 
         num_gprs = 1
         shape = []
-        for i in range(len(desc)-1):
+        i = 0
+        for i in range(len(desc)):
             dim = desc[i]
-            assert isinstance(dim, int)
+            if not isinstance(dim, int):
+                break
             shape.append(dim)
             num_gprs *= dim
+
+        dtype = desc[i]
+        assert isinstance(dtype, str), f"{desc=} {i=} {dtype=}"
+
+        if i + 1 < len(desc):
+            initial_values = desc[(i+1):]
+        else:
+            initial_values = None
 
         # allows empty shape info: `J.gpr("su32")`
         if len(shape) == 0:
@@ -1036,16 +1158,25 @@ class JIT:
         gprs = self.new_gpr(rtype, num_gprs, dtype, align, name)
         # set additional shape meta data for easier indexing & slicing
         gprs.set_shape(shape)
+
+        if initial_values is not None:
+            if isinstance(initial_values, list) or isinstance(initial_values, tuple):
+                n_values = len(initial_values)
+                flatten_gprs = gprs[...]
+                for i in range(len(flatten_gprs)):
+                    flatten_gprs[i] = initial_values[min(i, n_values-1)]
+            else:
+                gprs[...] = initial_values
+
         return gprs
 
 
     def new_gpr(self, reg_type, count_range, dtype="u32", align=1, name=""):
         if name == "":
             # try to reover python var's name from code_context
-            stack = inspect.stack()
-            caller_frame = stack[1]
-            if caller_frame.code_context:
-                src_line = caller_frame.code_context[0].strip()
+            code_context = inspect.getframeinfo(inspect.currentframe().f_back).code_context
+            if code_context:
+                src_line = code_context[0].strip()
                 name = src_line.split("=")[0].strip()
 
         dtype = dtype.replace("fp32","f32")
@@ -1056,7 +1187,7 @@ class JIT:
             count = count_range
             start_id = self._align_up(self.free_gpr_id[reg_type], align)
             self.free_gpr_id[reg_type] = start_id + count
-            gprs = GPRs(self, reg_type, start_id, count, dtype=dtype, align=align, name=name)
+            gprs = GPRs(self, reg_type, start_id, count, dtype=dtype, align=align, name=name, is_fixed=False)
             self.relocatable_gprs.append(gprs)
             return gprs
         elif isinstance(count_range, tuple) or isinstance(count_range, list):
@@ -1066,14 +1197,63 @@ class JIT:
             assert self.free_gpr_id[reg_type] <= first_id, "specified reg has been allocated"
             assert self.free_gpr_id[reg_type] <= last_id, "specified reg has been allocated"
             self.free_gpr_id[reg_type] = last_id + 1
-            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, dtype=dtype, align=align, name=name)
+            gprs = GPRs(self, reg_type, first_id, last_id - first_id + 1, dtype=dtype, align=align, name=name, is_fixed=True)
             self.fixed_gprs.append(gprs)
             return gprs
         else:
             assert 0
 
-    def pass_dce(self):
+    # Dead Store Elimination
+    def pass_dse(self):
+        if self.is_no_pass(): return
+        # if a register is written multiple times w/o any read, all such writes can be removed
+        # dead loads, if a load dst is used by no one, remove such loads
+        gpr_stores = {}
+        gpr_src = set()
+        for bid, bb in enumerate(self.blocks):
+            for iid, inst in enumerate(bb.instructions):
+                possible_src_id0 = 0
+                if inst.is_simple_operand0_store():
+                    dst_gpr = inst.operands[0]
+                    flatten_gpr = dst_gpr[...]
+                    for i in range(len(flatten_gpr)):
+                        key = repr(flatten_gpr[i])
+                        if key not in gpr_stores:
+                            gpr_stores[key] = []
+                        gpr_stores[key].append((bid, iid))
+                    possible_src_id0 = 1 # skip dst-gpr for src-gpr tests
+                for op in inst.operands[possible_src_id0:]:
+                    if not isinstance(op, GPRExpr):
+                        continue
+                    flatten_gpr = op[...]
+                    for i in range(len(flatten_gpr)):
+                        key = repr(flatten_gpr[i])
+                        gpr_src.add(key)
 
+        # keep store-only gprs
+        for key in gpr_src:
+            if key in gpr_stores:
+                del gpr_stores[key]
+
+        for key in gpr_stores:
+            # just store, no use/read
+            for bid, iid in gpr_stores[key]:
+                inst = self.blocks[bid].instructions[iid]
+                if inst.is_dead: continue
+                # all component of dst must also be marked as dead-store
+                dst_gpr = inst.operands[0]
+                flatten_dst = dst_gpr[...]
+                if all([repr(r) in gpr_stores for r in flatten_dst]):
+                    inst.is_dead = True
+
+        # remove dead-loads
+        for bb in self.blocks:
+            for i in range(len(bb.instructions)-1, -1, -1):
+                if bb.instructions[i].is_dead:
+                    bb.instructions.pop(i)
+
+    def pass_dce(self):
+        if self.is_no_pass(): return
         inst_list = []
         serial_index = 0
         for bb in self.blocks:
@@ -1084,15 +1264,13 @@ class JIT:
 
         # in unit of one gpr
         def is_normal_gpr(op):
-            if (not isinstance(op, GPRExpr)) and (not isinstance(op, GPRs)):
+            if not isinstance(op, GPRExpr):
                 return False
-            gprs = op
-            if isinstance(gprs, GPRExpr):
-                assert gprs.op == "getitem"
-                gprs = gprs.src0
+            assert op.op == "getitem"
+            gprs = op.src0
             assert isinstance(gprs, GPRs), f"{type(gprs)}"
             return not (gprs in self.fixed_gprs)
-            
+
         live_intervals = {}
         for bid, bb in enumerate(self.blocks):
             for iid, inst in enumerate(bb.instructions):
@@ -1118,7 +1296,12 @@ class JIT:
 
             for gpr_repr in useless_gprs:
                 del live_intervals[gpr_repr]
+
+                ivs = useless_gprs[gpr_repr]
+                if len(ivs) < 3:
+                    continue # the instruction has been marked as dead
                 bid, iid, sid  = useless_gprs[gpr_repr][:3]
+                
                 inst = self.blocks[bid].instructions[iid]
                 if inst.is_dead:
                     continue
@@ -1138,12 +1321,84 @@ class JIT:
                                     id = live_intervals[key].index(sid, 2)
                                     del live_intervals[key][id]
 
-        # remove dead-loads
+        # delete dead instructions
         for bb in self.blocks:
-            # delete dead instructions
             for i in range(len(bb.instructions)-1, -1, -1):
                 if bb.instructions[i].is_dead:
                     bb.instructions.pop(i)
+
+    def pass_break_down_gprs(self):
+        if self.is_no_pass(): return
+        # gprs are allocate in unit of GPRs, break GPRs into smaller pieces
+        # can help to reduce register space fragmentation issue.
+        # each instruction operand reference to gpr represents a 
+        # requirement on physical adjacency of a subset of GPRs
+        # and these requirement are overlapping, for example:
+        #     v[0:3] requires v[0,1,2,3] to be physically adjacent to each other
+        #      - v[0:1] requirements are weaker than above one.
+        #      - v[2:5] further extends physical adjacency of 0:3 to 0:5
+        #     so basically these requirements, if overlapping with each other
+        #     they will form a bigger adjacency requirement. all such requirements
+        #     are maintained in GPRs.
+        # some referencing are not used to compose instructions and such reference
+        # are just logical references and not a physical requirement, so we need 
+        # go through all instructions and collect real adjacency requirements.
+        # these adjacency requirements help to break GPRs into smaller pieces
+        class GPRparts:
+            def __init__(self, name):
+                self.parts = []
+                self.name = name
+            def update(self, first, last, loc):
+                merged_parts = []
+                merged_locs = [loc]
+                for i,p in enumerate(self.parts):
+                    i0,i1,locs = p
+                    n0,n1 = min(i0, first), max(i1, last)
+                    full_range = n1 - n0 + 1
+                    max_range = (i1-i0+1) + (last-first+1)
+                    if full_range < max_range:
+                        # overlapping
+                        merged_parts.append(i)
+                        merged_locs.extend(locs)
+                        first, last = n0, n1 # new range
+                # delete merged parts
+                for i in range(len(self.parts)-1, -1, -1):
+                    if i in merged_parts:
+                        self.parts.pop(i)
+                self.parts.append((first, last, merged_locs))
+
+        gpr_parts = {}
+        for bid, bb in enumerate(self.blocks):
+            for iid, inst in enumerate(bb.instructions):
+                for oid,op in enumerate(inst.operands):
+                    if not isinstance(op, GPRExpr): continue
+                    assert op.op == "getitem"
+                    gprs = repr(op.src0)
+                    first = op.src1
+                    last = op.src2
+                    if op.src0.count == 1 or op.src0.rtype == 's': continue
+                    if gprs not in gpr_parts:
+                        gpr_parts[gprs] = GPRparts(op.src0.name)
+                    gpr_parts[gprs].update(first, last, (bid,iid,oid))
+
+        for k,parts in gpr_parts.items():
+            if len(parts.parts) == 1: continue
+            #print("#### ", k)
+            for first, last, locs in parts.parts:
+                gprs = self.gpr(last-first+1, k[0]+"u32", name=f"{parts.name}[{first}:{last}]")
+                #print(first, last, locs)
+                for bid,iid,oid in locs:
+                    inst = self.blocks[bid].instructions[iid]
+                    #sin = repr(inst)
+                    op = inst.operands[oid]
+                    # some instructions may share same GPRExpr
+                    if op.src0 is gprs: continue
+                    #op0 = repr(op)
+                    op.src1 = op.src1 - first
+                    op.src2 = op.src2 - first
+                    op.src0 = gprs
+                    #op1 = repr(op)
+                    #print(op0,"=====>",op1, "       ", sin, "====>", inst)
 
     # this step is not mandatory，but it allows more registers to use
     # linear-scan:
@@ -1151,36 +1406,29 @@ class JIT:
     #    do not touch `fixed_gprs`
     def register_allocation_linear_scan(self):
         # note: BB in self.blocks has been ordered, assign each instruction an serial
+        inst_dict = {}
         inst_list = []
         serial_index = 0
         for bb in self.blocks:
             for inst in bb.instructions:
                 inst.sid = serial_index
+                inst_dict[inst.sid] = inst
                 inst_list.append(inst)
                 serial_index += 1
 
         # find live-intervals of gprs in `relocatable_gprs`
         live_intervals = {}
-        bb_access_gprs = {}
         for bb in self.blocks:
-            bb_access_gprs[bb] = []
             for inst in bb.instructions:
                 # inst.sid
                 for op in inst.operands:
-                    if isinstance(op, GPRExpr):
-                        gprs = op.src0
-                    elif isinstance(op, GPRs):
-                        gprs = op
-                    else:
-                        continue
-                    if gprs in self.fixed_gprs:
-                        continue
-                    assert gprs in self.relocatable_gprs
+                    if not isinstance(op, GPRExpr): continue
+                    gprs = op.src0
+                    if gprs.is_fixed: continue
                     if gprs not in live_intervals:
                         live_intervals[gprs] = [inst.sid, inst.sid]
                     live_intervals[gprs][0] = min(live_intervals[gprs][0], inst.sid)
                     live_intervals[gprs][1] = max(live_intervals[gprs][1], inst.sid)
-                    bb_access_gprs[bb].append(gprs)
 
         # extend live-interval of gprs within loop
         # if jump to bb with higher sid, then we don't need to handle since interval logic works fine
@@ -1227,15 +1475,19 @@ class JIT:
             event_list.append((last_sid, 1, repr(gprs), gprs)) # 1 means last-use
 
         # linear_scan all events according to time
-        reg_resource = {"s":[0 for _ in range(103)],
+        reg_resource = {"s": [0 for _ in range(103)],
                         "v": [0 for _ in range(256)],
                         "a": [0 for _ in range(256)]}
+        gpr_used = {"s": [0 for _ in range(103)],
+                    "v": [0 for _ in range(256)],
+                    "a": [0 for _ in range(256)]}
         # reserve fixed gprs
         for gprs in self.fixed_gprs:
             i0 = gprs.start_id
             i1 = gprs.start_id + gprs.count
             reg_resource[gprs.rtype][i0:i1] = [1]*gprs.count
-        
+            gpr_used[gprs.rtype][i0:i1] = [1]*gprs.count
+
         '''
         self.rtype = rtype
         self.start_id = start_id
@@ -1278,12 +1530,13 @@ class JIT:
                     gprs.sid = sid
                     slots[i:(i+count)] = [1]*count # mark as used
                     alive_gprs.append(gprs)
+                    gpr_used[rtype][i:(i+count)] = [1]*count
                     return
             # summary for diagnose GPR overflow issue
             summary = gpr_usage() + "\n"
             for g in alive_gprs:
                 summary += f"\t{str(g.count):5s} {g.rtype}GPRs  {repr(g):15s} {g.name:20s}  {inst_list[g.sid].loc}\n"
-            assert 0, f"cannot allocate '{gprs.name}'  {rtype}GPRs x {count} {align=}, not enough resource:\n {summary}"
+            assert 0, f"{inst_list[sid].loc} cannot allocate '{gprs.name}'  {rtype}GPRs x {count} {align=}, not enough resource:\n {summary}"
 
         def free_gpr(gprs):
             rtype = gprs.rtype
@@ -1304,14 +1557,16 @@ class JIT:
                 if ev == 1: # last use(as src)
                     if gprs.start_id >= 0:
                         free_gpr(gprs)
-                        self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
+                        inst_dict[sid].loc += f" free '{gprs.name}'{gprs}"
+                        #self.asm_debug_info += f";free '{gprs.name}'{gprs} at #{sid}\n"
                     else:
                         unalloc_gprs.append(gprs)
             # allocation 
             for ev,gprs in events:
                 if ev == 0: # first use(as dst)
                     alloc_gpr(gprs, sid)
-                    self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
+                    inst_dict[sid].loc += f" alloc '{gprs.name}'{gprs}    {gpr_usage()}"
+                    #self.asm_debug_info += f";alloc '{gprs.name}'{gprs} at #{sid}      {gpr_usage()}\n"
 
             # in case some gpr's last & first sids are the same
             for gprs in unalloc_gprs:
@@ -1324,13 +1579,17 @@ class JIT:
                 debug_info = f"#{inst.loc}   sid:{inst.sid} "
                 for op in inst.operands:
                     if isinstance(op, GPRExpr):
-                        op = op.src0
-                    if isinstance(op, GPRs):
-                        debug_info += f"{op.name},"
+                        debug_info += f"{op.src0.name},"
                     else:
                         debug_info += f"{op},"
                 inst.debug_info = debug_info
-        return
+
+        used_gprs = []
+        for rtype in gpr_used:
+            for i, cnt in enumerate(gpr_used[rtype]):
+                if cnt > 0:
+                    used_gprs.append(f"{rtype}{i}")
+        return used_gprs
 
     def is_iconst(self, i):
         return isinstance(i, int) and (i >= -16) and (i <= 64)
@@ -1375,7 +1634,7 @@ class JIT:
                 return
             else:
                 assert isinstance(rhs, GPRExpr)
-                src1_gprs = self.new_gpr("s", 1, dtype="u32", align=1, name="")
+                src1_gprs = self.new_gpr("s", 1, dtype="u32", align=1, name="src1_gprs")
                 src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src1_operand, rhs, loc=loc)
                 add_low = Instruction(bb, f"s_add_u32", loc=loc)
@@ -1462,7 +1721,7 @@ class JIT:
                 # "getitem" expr can be used as operand directly
                 src0_operand = expr.src0
             else:
-                src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src0_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="src0_gprs")
                 src0_operand = GPRExpr("getitem", src0_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src0_operand, expr.src0, loc=loc)
         else:
@@ -1475,7 +1734,7 @@ class JIT:
                 # "getitem" expr can be used as operand directly
                 src1_operand = expr.src1
             else:
-                src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                src1_gprs = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="src1_gprs")
                 src1_operand = GPRExpr("getitem", src1_gprs, 0, 0)
                 self.recursive_expr_gen(bb, src1_operand, expr.src1, loc=loc)
         else:
@@ -1659,7 +1918,7 @@ class JIT:
                         need_compensation = -1
                     ceil_sd = ceil_sd & 0xFFFFFFFF
 
-                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="")
+                    temp = self.new_gpr(rtype, 1, dtype=dtype, align=1, name="temp")
                     Instruction(bb, f"s_mul_hi_i32", loc=loc)(dst_expr, src0_operand, ceil_sd)
                     if need_compensation == 1:
                         Instruction(bb, f"s_add_i32", loc=loc)(dst_expr, dst_expr, src0_operand)
@@ -1755,7 +2014,7 @@ class JIT:
                 if prev.isTransOp() and (not cur.isTransOp()) and (cur.isVALU()):
                     vdst = prev.operands[0]
                     for op in cur.operands:
-                        if (isinstance(op, GPRExpr) or isinstance(op, GPRs)) and vdst.overlap(op):
+                        if isinstance(op, GPRExpr) and vdst.overlap(op):
                             n_nops = 1
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU Trans op, Non-trans VALU op consumes result of that op]")
                             break
@@ -1918,7 +2177,7 @@ class JIT:
         self.debug_cond_sgpr = self.gpr("su32")
         self.debug_cond_sgpr[0] = cond
 
-    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype, gpr_layout=""):
+    def debug_log(self, gprs:Union[GPRs, GPRExpr], torch_dtype, gpr_layout="", message=""):
         """
         cond : filter the kernel instance to enable log
         """
@@ -1941,6 +2200,8 @@ class JIT:
                 args = src_line.split(".debug_log(")[-1].split(",")
                 if len(args) >= 1:
                     name = args[0].strip()
+        if message:
+            name = f'{name}("{message}")'
         # gprs
         gprs = gprs[...]
         if isinstance(gprs, GPRExpr):
@@ -2089,9 +2350,6 @@ class JIT:
             cnt += 1
         return ret
 
-    def is_gpr(self, op):
-        return isinstance(op, GPRs) or isinstance(op, GPRExpr)
-
     def pass_hide_dependency(self):
         # hide dependency between address calculation & ds_read/ds_write/global_load
         # by reorder instructions following the mem-access
@@ -2115,7 +2373,7 @@ class JIT:
                         if i + 1 >= len(bb.instructions):
                             break
                         next = bb.instructions[i + 1]
-                        if next.opcode.startswith("v_") and self.is_gpr(next.operands[0]) and (not next.operands[0].overlap(vaddr)):
+                        if next.opcode.startswith("v_") and isinstance(next.operands[0], GPRExpr) and (not next.operands[0].overlap(vaddr)):
                             bb.instructions[i], bb.instructions[i+1] = next, cur
                             i = i + 1
                             swap_cnt += 1
@@ -2160,45 +2418,35 @@ class JIT:
                 sgpr_loading.append(inst.operands[0])
 
     def pass_cse(self):
+        if self.is_no_pass(): return
         debug_enabled = self.debug_print()
 
         def is_gpr(op):
-            return isinstance(op, GPRs) or isinstance(op, GPRExpr)
+            return isinstance(op, GPRExpr)
 
         # check GPRs, GPRs can be optimized by CSE pass
         #   - written only once
         #   - accessed by 1 BB only
         #   - being read after written
         #
-        def vdst_operand_id(inst):
-            opcode = inst.opcode
-            mod = inst.mod
-            if opcode.startswith("buffer_load_") and "lds" in mod:
-                return -1
-            if opcode.startswith("ds_write") or \
-                opcode.startswith("global_store") or \
-                opcode.startswith("global_load_lds_") or \
-                opcode.startswith("flat_store_") or \
-                opcode.startswith("scratch_load_lds_") or \
-                opcode.startswith("buffer_store_"):
-                return -1
-            return 0
-
         gpr_info = {}
         for bb_id, bb in enumerate(self.blocks):
             for t, inst in enumerate(bb.instructions):
-                vdst_index = vdst_operand_id(inst)
+                vdst_index = inst.dst_operand_id()
                 for index, gpr in enumerate(inst.operands):
-                    if is_gpr(gpr):
+                    if isinstance(gpr, GPRExpr):
                         for i, r in enumerate(gpr):
                             key = repr(r)
                             if key not in gpr_info:
-                                gpr_info[key] = {"wr":"","location":list()}
-                            gpr_info[key]["location"].append((bb_id, t, index))
-                            if index == vdst_index:
-                                gpr_info[key]["wr"] += "w"
+                                info = {"wr":"","location":list()}
+                                gpr_info[key] = info
                             else:
-                                gpr_info[key]["wr"] += "r"
+                                info = gpr_info[key]
+                            info["location"].append((bb_id, t, index))
+                            if index == vdst_index:
+                                info["wr"] += "w"
+                            else:
+                                info["wr"] += "r"
         ssa_gpr = []
         for k,info in gpr_info.items():
             wr = info["wr"]
@@ -2213,7 +2461,7 @@ class JIT:
         # TODO: if some ssa gpr also only depends on ssa gpr(like threadIdx.x),
         # it means their value can exist across BB boundary
 
-        self.log("pass_cse: ", f"{ssa_gpr=}")
+        self.debug_print("pass_cse: ", f"{ssa_gpr=}")
         # we limited CSE to following instructions because they are used by recursive expression generation.
         # Result of these instructions can be reused w/o worry about side-effect.
         # but any other instructions, although cannot be elimited, may update registers holding the reusable value,
@@ -2259,7 +2507,6 @@ class JIT:
         global replace_index
         CSE_LIMIT = int(os.getenv("CSE_LIMIT", "999999"))
         for bb in self.blocks:
-
             reg_2_value_version = {}
             value_table = {}
 
@@ -2333,7 +2580,7 @@ class JIT:
                 if len(inst.operands) == 0: continue
                 # instruction may have multiple vdst/vsrc: v[4:7]
                 dst = inst.operands[0]
-                if isinstance(dst, GPRExpr) or isinstance(dst, GPRs):
+                if isinstance(dst, GPRExpr):
                     # Why "rw" instead of just "w" ?
                     # we cannot be 100% sure that first operand is dst,
                     # it may be a src too, let's be conservative
@@ -2341,7 +2588,7 @@ class JIT:
                         add_reg_access(r, t, "rw")
 
                 for src in inst.operands[1:]:
-                    if isinstance(src, GPRExpr) or isinstance(src, GPRs):
+                    if isinstance(src, GPRExpr):
                         for r in src:
                             add_reg_access(r, t, "r")
 
@@ -2354,64 +2601,70 @@ class JIT:
                 #       v3 = v1+v0; <===== this is not the same as v2
                 # 
                 if len(inst.operands) == 0: continue
-                vdst = inst.operands[0]
-                if not is_gpr(vdst):
+                vdsts = inst.operands[0]
+                if not isinstance(vdsts, GPRExpr):
                     continue
-
-                # invalidate previous value this vdst is holding
-                for k in list(value_table.keys()):
-                    v, version = value_table[k]
-                    if v is vdst and version < cur_version:
-                        del value_table[k]
-
-                cur_version = inc_value_version(vdst)
+                
+                # maintain a value version number for each vgpr instance
+                is_valid_gpr = True
+                for dst_gpr in vdsts:
+                    is_valid_gpr = is_valid_gpr and (repr(dst_gpr) in ssa_gpr)
+                    cur_version = inc_value_version(dst_gpr)
+                    # invalidate previous value this vdst is holding
+                    for k in list(value_table.keys()):
+                        v, version = value_table[k]
+                        if v is dst_gpr and version < cur_version:
+                            del value_table[k]
 
                 # all dst gprs must be valid (only written once)
-                is_valid_gpr = all([repr(r) in ssa_gpr for r in vdst])
-                if is_cse_inst(inst) and is_valid_gpr:
+                if is_valid_gpr and is_cse_inst(inst) :
                     # this key includes opcode & all input-values & modifiers
                     src_ops = []
                     for op in inst.operands[1:]:
-                        op_name = str(inst.op_repr(op))
-                        if is_gpr(op):
-                            op_name += "." + str(get_value_version(op))
+                        if isinstance(op, GPRExpr):
+                            op_name = ""
+                            for v in op:
+                                op_name += repr(v) + "." + str(get_value_version(v)) + ";"
+                        else:
+                            op_name = str(inst.op_repr(op))
                         src_ops.append(op_name)
                     # the dependent inputs are versioned, to avoid mismatches when some inputs
                     # may be updated with new value.
-                    key = f"{inst.opcode} {','.join(src_ops)} {inst.mod}"
-                    if key not in value_table:
-                        # first time a reusable value is generated in versioned vdst
-                        value_table[key] = [vdst, cur_version]
-                    else:
-                        vexist, version = value_table[key]
-                        if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
-                            if can_replace_vdst_with_exist_global(vdst):
-                                removed_insts.append(t)
-                                if debug_enabled:
-                                    print(f"===========  {replace_index} / {CSE_LIMIT=} ")
-                                    print(t, inst.loc, inst.debug_info, inst)
-                                    print(f"{vdst} replaced with  {vexist} {key} globally")
-                                replace_vdst_with_exist_global(vdst, vexist)
-                        else:
-                            # can we safely use this existing value?
-                            # we need to check life-cycle requirements:
-                            #   the last read from vdst happens before the next update(write) to vexist
-                            t_last_read = reg_access_last_read_from(vdst, t)
-                            t_next_update = reg_access_next_write_to(vexist, t)
-                            if debug_enabled:
-                                print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
-                                    (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
-                                print(t, inst.loc, inst.debug_info, inst)
-                                print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
-                                print(f"{reg_accesses[repr(vdst)]}")
-                            if t_next_update > t_last_read and replace_index < CSE_LIMIT:
-                                removed_insts.append(t)
-                                replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                    for idst,vdst in enumerate(vdsts):
+                        key = f"{inst.opcode} {','.join(src_ops)} {inst.mod} [{idst}]"
+                        if key not in value_table:
+                            # first time a reusable value is generated in versioned vdst
+                            value_table[key] = [vdst, cur_version]
+                        elif len(vdsts) == 1:
+                            vexist, version = value_table[key]
+                            if repr(vexist) in ssa_gpr and replace_index < CSE_LIMIT:
+                                if can_replace_vdst_with_exist_global(vdst):
+                                    removed_insts.append(t)
+                                    if debug_enabled:
+                                        print(f"===========  {replace_index} / {CSE_LIMIT=} ")
+                                        print(t, inst.loc, inst.debug_info, inst)
+                                        print(f"{vdst} replaced with  {vexist} {key} globally")
+                                    replace_vdst_with_exist_global(vdst, vexist)
                             else:
-                                # we cannot safely reuse vexist, optionally we can add another vexist
-                                # so others may benefit
-                                pass
-                        replace_index += 1
+                                # can we safely use this existing value?
+                                # we need to check life-cycle requirements:
+                                #   the last read from vdst happens before the next update(write) to vexist
+                                t_last_read = reg_access_last_read_from(vdst, t)
+                                t_next_update = reg_access_next_write_to(vexist, t)
+                                if debug_enabled:
+                                    print(f"===========  {replace_index} / {CSE_LIMIT=} ", 
+                                        (t_next_update > t_last_read) and (replace_index < CSE_LIMIT))
+                                    print(t, inst.loc, inst.debug_info, inst)
+                                    print(f"{vdst} replaced with  {vexist} {key} in range [{t+1}~{t_last_read}]")
+                                    print(f"{reg_accesses[repr(vdst)]}")
+                                if t_next_update > t_last_read and replace_index < CSE_LIMIT:
+                                    removed_insts.append(t)
+                                    replace_vdst_with_exist(t + 1, t_last_read, vdst, vexist)
+                                else:
+                                    # we cannot safely reuse vexist, optionally we can add another vexist
+                                    # so others may benefit
+                                    pass
+                            replace_index += 1
 
             # Eliminate
             bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
@@ -2493,14 +2746,24 @@ class JIT:
         self.dump_code(f"after_pass_hide_karg_loads")
 
         # Common Subexpression Elimination，CSE
+        #from viztracer import VizTracer
+        #with VizTracer(output_file="optional.json") as tracer:
         self.pass_cse()
         self.dump_code(f"after_pass_cse")
 
+        # Dead Store Elimination, DSE
+        self.pass_dse()
+        self.dump_code(f"after_pass_dse")
+
+        # Dead Code Elimination，DCE
         self.pass_dce()
         self.dump_code(f"after_pass_dce")
 
+        self.pass_break_down_gprs()
+        self.dump_code(f"after_pass_break_down_gprs")
+
         # for bb in self.blocks: print(repr(bb))
-        self.register_allocation_linear_scan()
+        used_gprs = self.register_allocation_linear_scan()
         self.dump_code(f"after_reg_allocation")
 
         # generate asm: basic blocks are in natural order
@@ -2537,11 +2800,11 @@ class JIT:
             print(color0)
             print(self.asm_debug_info)
             print(color1)
-        used_gprs = []
         artifact = {"asm":[]}
         for a in asm.splitlines():
             if a[0] == ";": continue
             artifact["asm"].append(a)
+            """
             for op in a.replace(","," ").split()[1:]:
                 if (op.startswith("s") or op.startswith("v") or op.startswith("a")) and (op[1].isdigit()):
                     gpr_type = op[0]
@@ -2555,6 +2818,7 @@ class JIT:
                     for idx in range(idx0, idx1 + 1):
                         str_gpr = f"{gpr_type}{idx}"
                         if str_gpr not in used_gprs: used_gprs.append(str_gpr)
+            """
         '''
         str_arg_c_del = ",".join([f"{a[0]} {a[1]}" for a in args])
         signature = f"{kernel_name}({str_arg_c_del})"
@@ -2638,6 +2902,30 @@ r'''
     def round_up(self, x, y):
         return self.div_up(x, y) * y
 
+    """
+    def compute_generator():
+        yield 16 # yield the cycles following instruction is going to take
+        J.v_mfma
+    
+    gen = compute_generator()
+    J.emit(gen, 32)         # emit instructions which consume 32 cycles
+
+    """
+    def emit(self, generators, cycles:int=99999999):
+        # canonicalize generators a list/tuple of generators
+        if isinstance(generators, types.GeneratorType):
+            generators = (generators,)
+        while cycles > 0:
+            found = False
+            for g in generators:
+                yield_cycle = next(g, None)
+                if yield_cycle is not None:
+                    found = True
+                    break
+            if not found:
+                break
+            cycles -= yield_cycle
+
     def emitter(self, yield_cycle = 1):
         def emit(generators:list, cycles:int=99999999):
             while cycles > 0:
@@ -2653,7 +2941,7 @@ r'''
 
     @cache
     def get_sgpr_const(self, value):
-        sgpr = self.gpr("su32")
+        sgpr = self.gpr("su32", name=f"sgpr_const_{value}")
         sgpr[0] = value
         return sgpr
     '''
@@ -2662,7 +2950,7 @@ r'''
     '''
     def reduce(self, vinst, vinput):
         self.s_nop(mod="2")
-        v1 = self.new_gpr('v',1,dtype="i32", align=1)
+        v1 = self.new_gpr('v',1,dtype="i32", align=1, name="reduce_v1")
         getattr(self, vinst)(v1, vinput, vinput, mod="row_shr:8 bound_ctrl:0")
         self.s_nop(mod="2")
         getattr(self, vinst)(v1, v1, v1, mod="row_shr:4 bound_ctrl:0")
@@ -2675,7 +2963,7 @@ r'''
         self.s_nop(mod="2")
         getattr(self, vinst)(v1, v1, v1, mod="row_bcast:31 bound_ctrl:0")
         self.s_nop(mod="2")
-        vaddr = self.new_gpr('v',1,dtype="i32", align=1)
+        vaddr = self.new_gpr('v',1,dtype="i32", align=1, name="reduce_vaddr")
         vaddr[0] = 63*4 # broadcast last lane to all lanes
         self.ds_bpermute_b32(v1, vaddr, v1) # vdst,  vaddr,    vdata   offset
         self.s_waitcnt(mod=f"lgkmcnt({0})")
@@ -2805,8 +3093,62 @@ r'''
     def silu(self, vgpr_src):
         return self.gpr(self.sigmoid(vgpr_src) * vgpr_src)
 
+
+    # a unified instruction for f32=>bf16 conversion
+    def uni_cvt_pk_bf16_f32(self, vdst, vsrc0, vsrc1):
+        if "gfx950" in self.arch:
+            return self.v_cvt_pk_bf16_f32(vdst, vsrc0, vsrc1)
+        else:
+            # this is simple but less accurate, no round to even
+            s_cvt_bf16_bias = self.get_sgpr_const(0x00008000)
+            return self.v_perm_b32(vdst,
+                                   vsrc0 + s_cvt_bf16_bias,
+                                   vsrc1 + s_cvt_bf16_bias,
+                                   self.get_sgpr_const(0x03_02_07_06))
+
     def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
         self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
+
+    def tb_swizzle(self, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:int, GroupNum:int):
+        J = self
+        if GroupNum <= 1 and M01 <= 1:
+            N0 = J.div_up(N, wg_N)
+            blk_m = J.gpr(block_1d_id // N0)
+            blk_n = J.gpr(block_1d_id - blk_m*N0)
+            return blk_m, blk_n
+
+        M0 = J.gpr(J.div_up(M, wg_M))
+        N0 = J.div_up(N, wg_N)
+        group_size    = J.div_up(M0 * N0, GroupNum)
+        big_group_num = J.gpr(GroupNum - (group_size * GroupNum - M0 * N0))
+        group_id_y    = J.gpr(block_1d_id // GroupNum)
+        group_id_x    = J.gpr(block_1d_id - group_id_y * GroupNum) 
+
+        remap_block_1d_id = J.gpr(group_id_x * group_size + group_id_y)
+
+        with J.If(group_id_x > big_group_num):
+            remap_block_1d_id[0] += (big_group_num - group_id_x)
+
+        idx_M0 = J.gpr(remap_block_1d_id // N0)
+        idx_N0 = J.gpr(remap_block_1d_id - idx_M0 * N0)
+
+        M0_tmp     = J.gpr(M0 // M01)
+        M0_mod_M01 = J.gpr(M0 - M0_tmp * M01)
+
+        # M01_adapt = (idx_M0 < M0 - M0_mod_M01) ? M01 : M0_mod_M01;
+        M01_adapt = J.gpr("su32")
+        J.SetMask("scc", idx_M0 < M0 - M0_mod_M01)
+        J.s_cselect_b32(M01_adapt, M01, M0_mod_M01)
+
+        idx_M00          = J.gpr(idx_M0 // M01)
+        idx_M01          = J.gpr(idx_M0 - idx_M00 * M01)
+        idx_N0_M01_local = J.gpr(idx_N0 + idx_M01 * N0)
+
+        N_out           = J.gpr(idx_N0_M01_local // M01_adapt)
+        idx_loc_mod_M01 = J.gpr(idx_N0_M01_local - N_out * M01_adapt)
+
+        M_out = J.gpr(idx_loc_mod_M01 + idx_M00 * M01)
+        return M_out, N_out
 
     @property
     def warp_id(self):
@@ -2832,7 +3174,7 @@ class Idx3D:
 
 _jit_kernel_unique_id = {}
 class jit_kernel:
-    def __init__(self, gen_func, extra_compiler_options, with_debug_log = False, dump_stat = False, force_recompile = False):
+    def __init__(self, gen_func, extra_compiler_options, with_debug_log = False, dump_stat = False, force_recompile = False, no_pass = None):
         assert callable(gen_func)
         self.extra_compiler_options = extra_compiler_options
         self.dump_stat = dump_stat
@@ -2841,6 +3183,7 @@ class jit_kernel:
         self.with_debug_log = with_debug_log
         self.gen_func = gen_func
         self.func_name = gen_func.__name__
+        self.no_pass = no_pass
         argspec = inspect.getfullargspec(gen_func)
         argtypes = gen_func.__annotations__
         compile_time_args = []
@@ -2902,12 +3245,12 @@ class jit_kernel:
         # put all generated files under $HOME/.pyhip
         cpp_src_fpath = f"{PYHIP_CACHE_DIR}/{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}.cpp"
 
-        J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}")
+        J = JIT(f"{self.func_name}-{self.gen_construct_id}-{kernel_key}-{self.gen_func_unique_id}", self.no_pass)
 
         with filelock.FileLock('.compile.lock'):
             # skip compilation process when target file already exists
             # note the `cpp_src_fpath` is supposed to be generated in previous run(with same compile_args)
-            
+
             if not self.force_recompile and \
                 not self.with_debug_log and \
                 os.path.isfile(cpp_src_fpath) and \
@@ -3001,14 +3344,15 @@ class jit_kernel:
         return artifact
 
 class jit:
-    def __init__(self, extra_compiler_options = "", with_debug_log=False, dump_stat = False, force_recompile = False):
+    def __init__(self, extra_compiler_options = "", with_debug_log=False, dump_stat = False, force_recompile = False, no_pass = None):
         self.extra_compiler_options = extra_compiler_options
         self.with_debug_log = with_debug_log
         self.dump_stat = dump_stat
         self.force_recompile = force_recompile
+        self.no_pass = no_pass
 
     def __call__(self, gen_func):
-        return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile)
+        return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile, self.no_pass)
 
 class Addr2D:
     def __init__(self, J:JIT, base, row_init, col_init, stride):
