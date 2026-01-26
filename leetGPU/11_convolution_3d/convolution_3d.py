@@ -40,6 +40,27 @@ import triton
 import triton.language as tl
 
 
+import triton
+import triton.language as tl
+
+
+def get_configs():
+    configs = []
+    for block_r in [16, 32, 64]:
+        for block_c in [16, 32, 64]:
+
+            for num_warps in [4, 8]:
+                configs.append(
+                    triton.Config(
+                        {'BLOCK_R': block_r, 'BLOCK_C': block_c}, 
+                        num_warps=num_warps
+                    )
+                )
+    return configs
+@triton.autotune(
+    configs=get_configs(),
+    key=['output_rows', 'output_cols', 'kernel_depth', 'kernel_rows', 'kernel_cols'],
+)
 @triton.jit
 def convolution_3d_triton(
     input,
@@ -135,7 +156,7 @@ def triton_impl(
     stride_id, stride_ir, stride_ic = input.stride()
     stride_kd, stride_kr, stride_kc = kernel.stride()
     stride_od, stride_or, stride_oc = output.stride()
-    #print(f"output_depth {output_depth}")
+
     grid = lambda META: (
         triton.cdiv(output_rows, META["BLOCK_R"])
         * triton.cdiv(output_cols, META["BLOCK_C"]),
@@ -163,9 +184,8 @@ def triton_impl(
         output_depth,
         output_rows,
         output_cols,
-        BLOCK_R=16,
-        BLOCK_C=16,
-        # DEPTH_BOCK=1, # 对应你签名里的拼写
+        # BLOCK_R=16,
+        # BLOCK_C=16,
     )
     pass
 
@@ -372,10 +392,10 @@ def test_2d_convolution():
             kernel_rows,
             kernel_cols,
         ),
-        "HIP/CUDA": lambda: triton_impl(
+        "HIP/CUDA": lambda: hip_impl(
             input,
             kernel,
-            triton_output,
+            hip_output,
             input_depth,
             input_rows,
             input_cols,
@@ -393,7 +413,6 @@ def test_2d_convolution():
     print("-" * 55)
 
     # * 4 是因为 float32 数据类型
-    # 假设是单通道 (C=1) 和单批次 (N=1)
     total_bytes = (input.numel() + kernel.numel() + output_tensor.numel()) * 4
 
     for name, func in implementations.items():
@@ -429,9 +448,10 @@ def test_2d_convolution():
  
     Implementation       | Avg Time (ms)   | Throughput (GB/s)
     -------------------------------------------------------
-    Reference (Torch)    |        5.6035 |          5.76
-    Triton               |        0.9467 |         34.09
-    HIP/CUDA             |        0.9463 |         34.11
+    Reference (Torch)    |        5.6020 |          5.76
+    Triton               |        0.4697 |         68.72
+    HIP/CUDA             |        0.7979 |         40.45
+
     """
 if __name__ == "__main__":
     test_2d_convolution()
