@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #define KERNEL_SIZE (3)
+//template <int K_SIZE>
 __global__ void __launch_bounds__(256, 1) max_pooling(const float* input, float* output, int N, int C, int H, int W,
                       int kernel_size, int stride, int padding, int H_out, int W_out) {
   
@@ -38,7 +39,9 @@ __global__ void __launch_bounds__(256, 1) max_pooling(const float* input, float*
 
 #pragma unroll //如果 kernel_size 是变量，#pragma unroll 几乎没用。
         for (int i = 0; i < KERNEL_SIZE; ++i) {
+        //for (int i = 0; i < K_SIZE; ++i) {
 #pragma unroll
+            //for (int j = 0; j < K_SIZE; ++j) {
             for (int j = 0; j < KERNEL_SIZE; ++j) {
                 int cur_h = h_start + i;
                 int cur_w = w_start + j;
@@ -61,7 +64,7 @@ __global__ void __launch_bounds__(256, 1) max_pooling(const float* input, float*
 }
 
 
-// input, output are device pointers (i.e. pointers to memory on the GPU)
+// //input, output are device pointers (i.e. pointers to memory on the GPU)
 // extern "C" void solve(const float* input, float* output, int N, int C, int H, int W,
 //                       int kernel_size, int stride, int padding) {
        
@@ -70,11 +73,13 @@ __global__ void __launch_bounds__(256, 1) max_pooling(const float* input, float*
 
 //             dim3 threadsPerBlock(4, 16, 16);
 
-       
+    
 //             dim3 blocksPerGrid(
-//                 (N + threadsPerBlock.x - 1) / threadsPerBlock.x,
+//                 (H_out * W_out + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                
 //                 (C + threadsPerBlock.y - 1) / threadsPerBlock.y,
-//                 (H_out * W_out + threadsPerBlock.z - 1) / threadsPerBlock.z
+//                 (N + threadsPerBlock.z - 1) / threadsPerBlock.z
+                
 //             );
 
 //             max_pooling<<<blocksPerGrid, threadsPerBlock>>>(
