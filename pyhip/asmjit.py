@@ -85,6 +85,28 @@ def _utils_is_simple_operand0_store(opcode, mod):
 
     return False
 
+@cache
+def _utils_accept_accvgpr(opcode, mod):
+    if opcode.startswith("v_accvgpr_"):
+        return True
+    if opcode.startswith("v_mfma_"):
+        return True
+    if opcode.startswith("v_smfmac_"):
+        return True
+    if opcode.startswith("flat_"):
+        return True
+    if opcode.startswith("ds_"):
+        return True
+    if opcode.startswith("buffer_"):
+        return True
+    if opcode.startswith("tbuffer_"):
+        return True
+    if opcode.startswith("global_"):
+        return True
+    if opcode.startswith("scratch_"):
+        return True
+    return False
+
 # https://llvm.org/docs/AMDGPUInstructionSyntax.html#amdgpu-syn-instructions
 class Instruction:
     def __init__(self, parent_bb:'BasicBlock', opcode, loc=""):
@@ -784,11 +806,12 @@ os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
 
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
-PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
 PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
 PYHIP_NOPASS = os.getenv("PYHIP_NOPASS", "").split(":")
 
+if len(PYHIP_DEBUG_LOG):
+    PYHIP_RECOMPILE = 1
 if len(PYHIP_DUMP_DIR):
     # remove temp-cache to force recompile once 
     PYHIP_RECOMPILE = 1
@@ -801,11 +824,13 @@ _arch_lds_size = {
     "gfx950": 160*1024
 }
 class JIT:
-    def __init__(self, kernel_tag = "", no_pass = None):
-        self.arch = amdgpu_arch()
-        assert self.arch.startswith("gfx")
-        self.gfx = int(self.arch[3:])
+    arch = amdgpu_arch()
+    assert arch.startswith("gfx")
+    gfx = int(arch[3:])
+    cdna = 4 if gfx >= 950 else 3
+    warp_size = 64
 
+    def __init__(self, kernel_tag = "", no_pass = None):
         self.no_pass = PYHIP_NOPASS if no_pass is None else no_pass
         self.blocks = []
         # increased freely
@@ -822,7 +847,10 @@ class JIT:
         self.special_vars = {}
         self.kernel_tag = kernel_tag
         # sizeof mnemonics
-        self.sizeof_fp32 = 4
+        self.sizeof_f32 = 4
+        self.sizeof_f16 = 2
+        self.sizeof_s32 = 4
+        self.sizeof_u32 = 4
         self.sizeof_DW = 4
         self.sizeof_DW2 = 8
         self.sizeof_DW4 = 16
@@ -831,6 +859,7 @@ class JIT:
         self.sizeof_fp16 = 2
         self.sizeof_fp8 = 1
         self.sizeof_bf8 = 1
+        self.sizeof_fp4x2 = 1
         # allows J.sizeof(dtype), dtype can be string or torch dtype
         self._sizeof = {
             "dw4" : 16,
@@ -874,13 +903,17 @@ class JIT:
             #    fp8/float8_e4m3fnuz & bf8/float8_e5m2fnuz
             # torch.float8_e4m3fnuz:1,
             # torch.float8_e5m2fnuz:1,
+            "fp4x2" : 1
         }
 
-    def sizeof(self, dtype):
+    def sizeof(self, dtype, cnt=1):
+        if str(dtype) in ["torch.float4_e2m1fn_x2", "fp4x2"]:
+            assert cnt % 2 == 0
+            return cnt//2
         if isinstance(dtype ,str):
-            return self._sizeof[dtype]
+            return self._sizeof[dtype] * cnt
         # assume it's torch dype
-        return dtype.itemsize
+        return dtype.itemsize * cnt
 
     def __getattr__(self, instruction):
         if self.current_bb is None:
@@ -1293,6 +1326,7 @@ class JIT:
                     useless_gprs[gpr_repr] = ivs
 
             if len(useless_gprs) == 0: break
+            self.debug_print("useless_gprs: ", useless_gprs)
 
             for gpr_repr in useless_gprs:
                 del live_intervals[gpr_repr]
@@ -1706,7 +1740,10 @@ class JIT:
             # assign
             src_cnt = expr.src2 - expr.src1 + 1
             assert src_cnt == 1
-            new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
+            if rtype == "v" and expr.src0.rtype == "a":
+                new_inst = Instruction(bb, f"v_accvgpr_read_b32", loc=loc)
+            else:
+                new_inst = Instruction(bb, f"{rtype}_mov_b32", loc=loc)
             new_inst(dst_expr, expr)
             return
 
@@ -1995,6 +2032,25 @@ class JIT:
                     expr_insts.append(inst)
             self.compile_bb_expr(bb, expr_insts)
 
+    def pass_a2v(self):
+        # each operand must be gpr, not expression
+        for bb in self.blocks:
+            i = 0
+            while i < len(bb.instructions):
+                cur = bb.instructions[i]
+                if not _utils_accept_accvgpr(cur.opcode, cur.mod):
+                    for opid, op in enumerate(cur.operands):
+                        if isinstance(op, GPRExpr) and op.find_rtype() == "a":
+                            assert opid != 0, f"destination for {cur} cannot be accvgpr"
+                            cnt = len(op)
+                            vgpr = self.gpr(cnt, "vu32")
+                            for j in range(cnt):
+                                inst = Instruction(bb, "v_accvgpr_read_b32")
+                                inst(vgpr[j], op[j], insert_bb_pos = i)
+                            cur.operands[opid] = vgpr[...]
+                            i += 1
+                i += 1
+
     def pass_insert_nop(self):
         for bb in self.blocks:
             i = 1
@@ -2017,6 +2073,14 @@ class JIT:
                         if isinstance(op, GPRExpr) and vdst.overlap(op):
                             n_nops = 1
                             self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU Trans op, Non-trans VALU op consumes result of that op]")
+                            break
+
+                if prev.opcode.startswith("v_") and cur.opcode.startswith("v_permlane"):
+                    vdst = prev.operands[0]
+                    for op in cur.operands:
+                        if isinstance(op, GPRExpr) and vdst.overlap(op):
+                            n_nops = 2
+                            self.log(f"insert s_nop({n_nops}) at #{loc} : [VALU* writes vdst, V_PERMLANE* reads vdst]")
                             break
 
                 if n_nops >= 0:
@@ -2689,11 +2753,7 @@ class JIT:
                 print(self.current_bb.debug_str(), file=f)
         dump_serial_id += 1
 
-    def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
-        self.asm_debug_info = ""
-        self._finish_bb(self.current_bb)
-
-        # remove unreachable bb
+    def pass_remove_dead_bb(self):
         bb_to_remove = []
         for bb in self.blocks[1:]:
             if len(bb.predecessors) == 0:
@@ -2729,6 +2789,18 @@ class JIT:
         for empty_bb in bb_to_remove:
             self.blocks.remove(empty_bb)   
         '''
+
+    def build(self, kernel_name, signature, extra_compiler_options, cpp_src_fpath, dump_stat):
+        self.asm_debug_info = ""
+        self._finish_bb(self.current_bb)
+
+        self.dump_code(f"after_nothing")
+
+        self.pass_remove_dead_bb()
+        self.dump_code(f"after_pass_remove_dead_bb")
+
+        self.pass_a2v()
+        self.dump_code(f"after_pass_a2v")
 
         # use following way only
         # if we want to do multi-expression optimization (like common expr extraction...)
@@ -2923,8 +2995,9 @@ r'''
                     found = True
                     break
             if not found:
-                break
+                return False
             cycles -= yield_cycle
+        return True
 
     def emitter(self, yield_cycle = 1):
         def emit(generators:list, cycles:int=99999999):
@@ -3096,7 +3169,7 @@ r'''
 
     # a unified instruction for f32=>bf16 conversion
     def uni_cvt_pk_bf16_f32(self, vdst, vsrc0, vsrc1):
-        if "gfx950" in self.arch:
+        if self.cdna >= 4:
             return self.v_cvt_pk_bf16_f32(vdst, vsrc0, vsrc1)
         else:
             # this is simple but less accurate, no round to even
@@ -3149,6 +3222,94 @@ r'''
 
         M_out = J.gpr(idx_loc_mod_M01 + idx_M00 * M01)
         return M_out, N_out
+
+    @classmethod
+    def show_mfma_in_lds(cls, mfma_MN, num_mfmas, swizzle_1=0, swizzle_2=0):
+        '''
+            visualize mfma lanes inside LDS
+        '''
+        if cls.cdna == 4:
+            lane_groups = [
+                [0,1,2,3, 12,13,14,15, 20,21,22,23, 24,25,26,27],
+                [4,5,6,7, 8,9,10,11,  16,17,18,19, 28,29,30,31],
+                [32,33,34,35, 44,45,46,47, 52,53,54,55, 56,57,58,59],
+                [36,37,38,39, 40,41,42,43, 48,49,50,51, 60,61,62,63]
+            ]
+            num_LDS_banks = 64
+        else:
+            assert cls.cdna == 3
+            lane_groups = [
+                [0, 1, 2, 3, 20, 21, 22, 23],
+                [4, 5, 6, 7, 16, 17, 18, 19],
+                [8, 9, 10, 11, 28, 29, 30, 31],
+                [12, 13, 14, 15, 24, 25, 26, 27],
+                [32, 33, 34, 35, 52, 53, 54, 55],
+                [36, 37, 38, 39, 48, 49, 50, 51],
+                [40, 41, 42, 43, 60, 61, 62, 63],
+                [44, 45, 46, 47, 56, 57, 58, 59]
+            ]
+            num_LDS_banks = 32
+        def lane_group_id(i):
+            for gid,lg in enumerate(lane_groups):
+                if i in lg:
+                    return gid
+            return -1
+        def lane_str(i):
+            group_id = lane_group_id(i)
+            if group_id < 0:
+                i = (i % 64)
+                group_id = -53 # use a special color
+            color0 = f"\033[0;{100+(group_id)}m"
+            color1 = f"\033[0m"
+            return f"{color0} {i:03} {color1}"
+
+        num_LDS_DW4_banks = num_LDS_banks // 4
+
+        assert cls.warp_size % mfma_MN == 0
+        mfma_K_lanes = cls.warp_size // mfma_MN
+
+        k_lanes = mfma_K_lanes * num_mfmas
+
+        # assume the size of mfma lane is also DW4
+        assert num_LDS_DW4_banks % k_lanes == 0
+        mfma_rows_per_banks = num_LDS_DW4_banks // k_lanes
+        assert mfma_MN % mfma_rows_per_banks == 0
+        num_bank_rows = mfma_MN // mfma_rows_per_banks
+
+        print(f"CDNA{cls.cdna} MFMA:{mfma_MN}x{mfma_K_lanes} 1x{num_mfmas} {num_LDS_banks=} {num_LDS_DW4_banks=} {k_lanes=} {swizzle_1=} {swizzle_2=}")
+        if swizzle_2:
+            print(f"\t  logical_col = (logical_col ^ (logical_row // {swizzle_2})) % {k_lanes}")
+        bank_lg = [list() for bank_col in range(num_LDS_DW4_banks)]
+        for bank_row in range(num_bank_rows):
+            for bank_col in range(num_LDS_DW4_banks):
+                row = bank_row
+                # swizzle is done in term of LDS bank rows & cols
+                if swizzle_1:
+                    col = (bank_col ^ row) % num_LDS_DW4_banks
+                else:
+                    col = bank_col
+
+                logical_row = (row * mfma_rows_per_banks + col//k_lanes)
+                logical_col = col % k_lanes
+                if swizzle_2:
+                    logical_col = (logical_col ^ (logical_row // swizzle_2)) % k_lanes
+                # at physical location (r0,c0)
+                # 
+                i0 = logical_col*mfma_MN + logical_row
+                if i0 < cls.warp_size:
+                    lg = lane_group_id(i0)
+                    bank_lg[bank_col].append(lg)
+                print(lane_str(i0),end="")
+            print("")
+
+        for bank in range(num_LDS_DW4_banks):
+            conflict = 0
+            for lg in set(bank_lg[bank]):
+                c = bank_lg[bank].count(lg)
+                conflict += c - 1 if c > 1 else 0
+            if conflict:
+                print(f"bank{bank}: {conflict} conflicts : lane-groups {bank_lg[bank]} ")
+        print()
 
     @property
     def warp_id(self):
