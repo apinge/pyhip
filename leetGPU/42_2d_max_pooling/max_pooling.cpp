@@ -6,13 +6,14 @@
 #include <cstdio>
 #include <cstdlib>
 
-__global__ void max_pooling(const float* input, float* output, int N, int C, int H, int W,
+#define KERNEL_SIZE (3)
+__global__ void __launch_bounds__(256, 1) max_pooling(const float* input, float* output, int N, int C, int H, int W,
                       int kernel_size, int stride, int padding, int H_out, int W_out) {
   
 // 1. 严格对应 Python 传入的维度
-    int batch = blockIdx.x * blockDim.x + threadIdx.x; 
+    int pos = blockIdx.x * blockDim.x + threadIdx.x; 
     int channel = blockIdx.y * blockDim.y + threadIdx.y;
-    int pos = blockIdx.z * blockDim.z + threadIdx.z;
+    int batch = blockIdx.z * blockDim.z + threadIdx.z;
 
     // 2. 边界检查
     if (batch < N && channel < C && pos < H_out * W_out) {
@@ -35,8 +36,10 @@ __global__ void max_pooling(const float* input, float* output, int N, int C, int
         // 输入是 (N, C, H, W)
         int in_base = batch * (C * H * W) + channel * (H * W);
 
-        for (int i = 0; i < kernel_size; ++i) {
-            for (int j = 0; j < kernel_size; ++j) {
+#pragma unroll //如果 kernel_size 是变量，#pragma unroll 几乎没用。
+        for (int i = 0; i < KERNEL_SIZE; ++i) {
+#pragma unroll
+            for (int j = 0; j < KERNEL_SIZE; ++j) {
                 int cur_h = h_start + i;
                 int cur_w = w_start + j;
 

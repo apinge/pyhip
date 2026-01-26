@@ -187,11 +187,29 @@ def hip_impl(
     output_tensor.zero_()
     H_out = (H + 2 * padding - kernel_size) // stride + 1
     W_out = (W + 2 * padding - kernel_size) // stride + 1
+    """
+    CUDA/HIP 优化的核心:访存合并(Memory Coalescing)
+    原始的写法是
     threadsPerBlock = [4, 4, 64]  # not larger than 1024
     blocksPerGrid = [
         (N + threadsPerBlock[0] - 1) // threadsPerBlock[0],
         (C + threadsPerBlock[1] - 1) // threadsPerBlock[1],
         (H_out * W_out + threadsPerBlock[2] - 1) // threadsPerBlock[2],
+    ]
+    如果你线程的最内层索引 threadIdx.x 对应的不是内存中连续的地址 比如对应了 Batch 而非 Width*Hight。
+    那么 GPU 无法进行“合并访存”。每次线程读取数据都会触发多次内存事务，效率极低。
+    
+    把外层threadIdx.x变成连续的H*W的地址 并给比较大的gridim 提高效率
+    这会减少线程块内部的维度计算（ threadIdx.y 和 threadIdx.z 相关的乘加法，让 GPU 把更多精力花在搬运数据上
+
+    threadsPerBlock调成[256,1,1]比[1024,1,1]更好 
+    可能是寄存器不够分, 另外1024是上限 灵活度更差
+    """
+    threadsPerBlock = [ 256,1,1]  # not larger than 1024
+    blocksPerGrid = [
+        (H_out * W_out + threadsPerBlock[0] - 1) // threadsPerBlock[0],
+        (C + threadsPerBlock[1] - 1) // threadsPerBlock[1],
+        (N + threadsPerBlock[2] - 1) // threadsPerBlock[2],
     ]
     # print(threadsPerBlock)
     # print(blocksPerGrid)
@@ -332,6 +350,25 @@ def test_max_pooling():
     Reference (Torch)    |        0.1727 |        485.73
     Triton               |        0.1311 |        639.69
     HIP/CUDA             |        0.3925 |        213.70
+
+    
+    ## hip 访存合并后 (Memory Coalescing)
+    Implementation       | Avg Time (ms)   | Throughput (GB/s)
+    -------------------------------------------------------
+    Reference (Torch)    |        0.1739 |        482.52
+    Triton               |        0.1259 |        666.33
+    HIP/CUDA             |        0.1443 |        581.36
+
+    ## pragma unroll +  kernel size 固定为模板 
+    Implementation       | Avg Time (ms)   | Throughput (GB/s)
+    -------------------------------------------------------
+    Reference (Torch)    |        0.1735 |        483.41
+    Triton               |        0.1259 |        666.12
+    HIP/CUDA             |        0.1282 |        654.14
+
+    ## __launch_bounds__(256, 1)
+    __global__ void __launch_bounds__(256, 1) max_pooling_kernel(...)
+    优化寄存器分配
     """
 
 
