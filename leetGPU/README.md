@@ -13,6 +13,7 @@ To maintain broader portability, I've tried to write the code in a more general 
 
 ### triton 
 - [meta-pytorch/tritonbench](https://github.com/meta-pytorch/tritonbench)
+- [linkedin/Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
 ### GEMM
 - [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
 
