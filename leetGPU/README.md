@@ -8,7 +8,19 @@ Under the hood, pyhip uses HIP kernels to solve these problems. Since the platfo
 To maintain broader portability, I've tried to write the code in a more general style, rather than relying heavily on HIP- or CUDA-specific extensions.
 
 
-## Reference
+
+## Golden Solution
+
+### triton 
+- [meta-pytorch/tritonbench](https://github.com/meta-pytorch/tritonbench)
+### GEMM
+- [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
+
+### Attention 
+- [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
+
+
+## Other Reference
 
 
 - https://github.com/ROCm/rocPRIM
