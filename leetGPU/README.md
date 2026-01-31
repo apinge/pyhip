@@ -17,12 +17,14 @@ To maintain broader portability, I've tried to write the code in a more general 
 - [flagos-ai/FlagGems](https://github.com/flagos-ai/FlagGems/)
 
 - [linkedin/Liger-Kernel](https://github.com/linkedin/Liger-Kernel)
-### GEMM
+### CUDA/HIP
 - [NVIDIA/cutlass](https://github.com/NVIDIA/cutlass)
 
-### Attention 
 - [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer)
 
+- [HipKittens](https://github.com/HazyResearch/HipKittens)
+
+- [hunderKittens](https://github.com/HazyResearch/ThunderKittens)
 
 ## Other Reference
 
