@@ -24,7 +24,7 @@ To maintain broader portability, I've tried to write the code in a more general 
 
 - [HipKittens](https://github.com/HazyResearch/HipKittens)
 
-- [hunderKittens](https://github.com/HazyResearch/ThunderKittens)
+- [ThunderKittens](https://github.com/HazyResearch/ThunderKittens)
 
 ## Other Reference
 
