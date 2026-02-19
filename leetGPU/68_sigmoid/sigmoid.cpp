@@ -1,0 +1,22 @@
+#include <hip/hip_fp16.h> // for __fp16
+#include <hip/hip_bf16.h> // for bfloat16
+#include "hip/hip_runtime.h"
+#include <vector>
+#include <iostream>
+#include <cstdio>
+#include <cstdlib>
+__global__ void sigmoid_kernel(const float* X, float* Y, int N) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx<N){
+        Y[idx] = 1.0f / (1.0f + expf(-X[idx]));
+    }
+}
+
+// X, Y are device pointers (i.e. pointers to memory on the GPU)
+// extern "C" void solve(const float* X, float* Y, int N) {
+//     int threadsPerBlock = 256;
+//     int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
+
+//     sigmoid_kernel<<<blocksPerGrid, threadsPerBlock>>>(X, Y, N);
+//     cudaDeviceSynchronize();
+// }
