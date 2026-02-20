@@ -127,7 +127,7 @@ class Instruction:
         for i, op in enumerate(operands):
             # generate expression
             if isinstance(op, GPRExpr) and op.op != "getitem":
-                rtype = op.find_rtype()
+                rtype = op.find_rtype(allow_accvgpr=True)
                 dtype = op.find_dtype()
                 dst_gprs = jit.new_gpr(rtype, 1, dtype=dtype, align=1, name="idst")
                 dst_expr = GPRExpr("getitem", dst_gprs, 0, 0)
@@ -341,17 +341,20 @@ class GPRExpr:
             return self.src1.find_dtype()
         assert 0
 
-    def find_rtype(self):
+    def find_rtype(self, allow_accvgpr = False):
         if self.op == "getitem":
             return self.src0.rtype
         rtype0 = None
         rtype1 = None
+        # find_rtype returns "v" for "a" type vgpr, 
         if isinstance(self.src0, GPRExpr):
             rtype0 = self.src0.find_rtype()
-            if rtype0 == "v": return rtype0
+            if rtype0 == "v": return "v"
+            if allow_accvgpr and rtype0 == "a": return "v"
         if isinstance(self.src1, GPRExpr):
             rtype1 = self.src1.find_rtype()
-            if rtype1 == "v": return rtype1
+            if rtype1 == "v": return "v"
+            if allow_accvgpr and rtype1 == "a": return "v"
         assert rtype0 != "a"
         assert rtype1 != "a"
         if rtype0 == "s": return rtype0
@@ -687,11 +690,96 @@ class Buffer:
             mod += f" offset:{offset12}"
         return self.J.buffer_store_dword(vdata, voffset, self.desc, soffset, mod=mod)
 
+class Layout:
+    def __init__(self, J, shape, dtype, offset_bits = 12):
+        self.shape = shape
+        stride_bytes = [J.sizeof(dtype)]
+        for dim in reversed(shape):
+            cur = dim * stride_bytes[-1]
+            stride_bytes.append(cur)
+        self.size_bytes = stride_bytes[-1]
+        self.stride_bytes = list(reversed(stride_bytes))[1:]
+        self.dtype = dtype
+        self.offset_bits = offset_bits
+        self.J = J
+
+    def total_size(self):
+        return self.size_bytes
+
+    def size(self, dim=None):
+        if dim is None:
+            return self.shape
+        return self.shape[dim]
+
+    def stride(self, dim):
+        return self.stride_bytes[dim]
+
+    def __getitem__(self, coord_exprs):
+        assert isinstance(coord_exprs, tuple)
+
+        stride_bytes = self.stride_bytes
+        #print("1=========", stride_bytes)
+        if not isinstance(coord_exprs[-1], int) and not isinstance(coord_exprs[-1], GPRExpr):
+            # last one is a dtype with size
+            dtype = coord_exprs[-1]
+            coord_exprs = coord_exprs[:-1]
+            assert self.J.sizeof(dtype) % self.J.sizeof(self.dtype) == 0
+            # new dtype is group of original element
+            group_size = self.J.sizeof(dtype) // self.J.sizeof(self.dtype)
+            stride_bytes = [s for s in self.stride_bytes]
+            stride_bytes[-1] = self.J.sizeof(dtype)
+            #print("2=========", stride_bytes)
+
+        const_terms = 0
+        exprs = []
+        for i, ep in enumerate(coord_exprs):
+            if isinstance(ep, int):
+                const = ep
+                nc_ep = None
+            else:
+                # assert isinstance(ep,GPRExpr)
+                const, nc_ep = ep.split_const_terms()
+            const_terms += const*stride_bytes[i]
+            exprs.append(nc_ep)            
+
+        # combine non-const part
+        cur_expr = None
+        for i, ep in enumerate(exprs):
+            if ep is None: continue
+            if i == 0:
+                cur_expr = ep * stride_bytes[i]
+            else:
+                cur_expr = cur_expr + ep * stride_bytes[i]
+        off0 = 0
+        off1 = 0
+        if self.offset_bits > 0:
+            off0 = 0
+            off1 = 1<<self.offset_bits
+        elif self.offset_bits < 0:
+            bits = -self.offset_bits-1
+            off0 = -(1<<bits)
+            off1 = 1<<bits
+
+        if const_terms < off0 or const_terms >= off1:
+            offset0 = 0
+            cur_expr = cur_expr + const_terms
+        else:
+            offset0 = const_terms
+
+        if cur_expr is not None:
+            loc = "" #get_caller_loc()
+            voffset = self.J.gpr("vu32")
+            self.J.recursive_expr_gen(self.J.current_bb, voffset[0], cur_expr, loc=loc)
+        else:
+            voffset = None
+
+        return voffset, offset0
+
 class LDSTensor:
     def __init__(self, J, shape, dtype, lds_base=None):
         self.J = J
         self.shape = shape
-        stride_bytes = [dtype.itemsize]
+        stride_bytes = [J.sizeof(dtype)]
         for i,dim in enumerate(reversed(shape)):
             cur = dim * stride_bytes[-1]
             stride_bytes.append(cur)
@@ -718,11 +806,31 @@ class LDSTensor:
             self.J.free_lds(self.lds_base)
             self.own = False
 
+    def read_(self, *coord_exprs, offset1=None):
+        assert self.dtype in ["b32", "b64", "b128"]
+        if getattr(self, "swizzle", None):
+            coord_exprs = list(coord_exprs)
+            self.swizzle(coord_exprs)
+        return self._access("read", self.dtype, None, *coord_exprs, offset1=offset1)
+
+    def write_(self, *coord_exprs, offset1=None):
+        assert self.dtype in ["b32", "b64", "b128"]
+        if getattr(self, "swizzle", None):
+            coord_exprs = list(coord_exprs)
+            self.swizzle(coord_exprs)
+        return self._access("write", self.dtype, None, *coord_exprs, offset1=offset1)
+
     def read(self, dtype:str, vdst, *coord_exprs, offset1=None):
-        self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
+        if getattr(self, "swizzle", None):
+            coord_exprs = list(coord_exprs)
+            self.swizzle(coord_exprs)
+        return self._access("read", dtype, vdst, *coord_exprs, offset1=offset1)
 
     def write(self, dtype:str, vdst, *coord_exprs, offset1=None):
-        self._access("write", dtype, vdst, *coord_exprs, offset1=offset1)
+        if getattr(self, "swizzle", None):
+            coord_exprs = list(coord_exprs)
+            self.swizzle(coord_exprs)
+        return self._access("write", dtype, vdst, *coord_exprs, offset1=offset1)
 
     # reuse the same share buffer
     def view_as(self, shape, dtype):
@@ -782,19 +890,53 @@ class LDSTensor:
                     offset0 = 0
                     cur_expr = cur_expr + const_terms
             offset0 += self.lds_base
-            assert offset0 >= 0 and offset0 < 160*1024
+            assert offset0 >= 0 and offset0 < 64*1024
             mod = f"offset:{offset0}"
             tag2 = ""
 
         loc = get_caller_loc()
         dst_gprs = self.J.gpr("vu32")
         self.J.recursive_expr_gen(self.J.current_bb, dst_gprs[0], cur_expr, loc=loc)
-        if op_name == "read":
-            getattr(self.J, f"ds_{op_name}{tag2}_{dtype}")(vdst, dst_gprs[0], mod=mod)
-        elif op_name == "write":
-            getattr(self.J, f"ds_{op_name}{tag2}_{dtype}")(dst_gprs[0], vdst, mod=mod)
+        inst_name = f"ds_{op_name}{tag2}_{dtype}"
+
+        def issue(vdst, off = 0, off1 = 0):
+            if offset1 is not None:
+                off += offset0
+                off1 += offset1
+                assert off >=0 and off < 256
+                assert off1 >=0 and off1 < 256
+                mod = f"offset0:{off} offset1:{off1}"
+            else:
+                off += offset0
+                assert off >= 0 and off < 64*1024
+                mod = f"offset:{off}"
+
+            if op_name == "read":
+                getattr(self.J, inst_name)(vdst, dst_gprs[0], mod=mod)
+            elif op_name == "write":
+                getattr(self.J, inst_name)(dst_gprs[0], vdst, mod=mod)
+            else:
+                assert 0, op_name
+
+        if vdst is not None:
+            issue(vdst)
+
+        # return the issue closure, so later-on it can be called with
+        # other vdst
+        return issue
+
+class _Addr2D:
+    def __init__(self, J:"JIT", base, row_init, col_init, stride):
+        self.vaddr = J.gpr('vu32')
+        # TODO: use shift to simplify
+        # TODO: remove zero add/mul
+        if isinstance(base, int) and base == 0:
+            self.vaddr[0] = row_init * stride + col_init
         else:
-            assert 0, op_name
+            self.vaddr[0] = base + row_init * stride + col_init
+
+    def get_addr(self):
+        return self.vaddr
 
 # JIT emits instructions into BBs
 all_kernel_hip_src_names = {}
@@ -805,7 +947,7 @@ PYHIP_CACHE_DIR = os.getenv("PYHIP_CACHE_DIR", os.path.expanduser("~/.pyhip"))
 os.makedirs(PYHIP_CACHE_DIR, exist_ok=True)
 
 PYHIP_DEBUG_LOG = os.getenv("PYHIP_DEBUG_LOG", "")
-PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "1"))
+PYHIP_JIT_LOG = int(os.getenv("PYHIP_JIT_LOG", "0"))
 PYHIP_DUMP_DIR = os.getenv("PYHIP_DUMP_DIR", "")
 PYHIP_RECOMPILE = int(os.getenv("PYHIP_RECOMPILE", "0"))
 PYHIP_NOPASS = os.getenv("PYHIP_NOPASS", "").split(":")
@@ -843,7 +985,8 @@ class JIT:
         self.mark_idx = 0
         self.debug_cond_sgpr = None
         self.debug_log_ptr = None
-        self.lds_allocator = SimpleMemoryAllocator(_arch_lds_size.get(self.arch, 64*1024))
+        self.lds_size_limit = _arch_lds_size.get(self.arch, 64*1024)
+        self.lds_allocator = SimpleMemoryAllocator(self.lds_size_limit)
         self.special_vars = {}
         self.kernel_tag = kernel_tag
         # sizeof mnemonics
@@ -868,16 +1011,27 @@ class JIT:
             "DWx4" : 16,
             "dwordx4":16,
             "DWORDx4":16,
+            "b128":16,
+
+            "DW2" : 8,
+            "dwordx2" : 8,
+            "bf16x4" : 8,
+            "b64":8,
+            "s64":8,
+            "u64":8,
 
             "f32" : 4,
             "fp32" : 4,
             "float" : 4,
+            "bf16x2" : 4,
             "int" : 4,
             "uint" : 4,
+            "dword" : 4,
             "DWORD" : 4,
             "DW" : 4,
             "s32": 4,
             "u32": 4,
+            "b32": 4,
 
             "bf16" : 2,
             "bfloat16":2,
@@ -969,6 +1123,9 @@ class JIT:
         buff.setup(sgpr_base, sgpr_size)
         return buff
 
+    def Addr2D(self, base, row_init, col_init, stride):
+        return _Addr2D(self, base, row_init, col_init, stride)
+
     '''
     # scalar jump (wave level, no divergent)
     '''
@@ -1022,12 +1179,25 @@ class JIT:
         caller_frame = current_frame.f_back.f_back
         lineno = caller_frame.f_lineno
         label_end = f"_if_end_{lineno}_{self.mark_idx}"
+        label_else = f"_if_else_{lineno}_{self.mark_idx}"
         self.mark_idx += 1
-        self.Jump(label_end, cond, reverse=True)
+        self.Jump(label_else, cond, reverse=True)
+        with_else = False
+        J = self
+        class IfStatement:
+            def Else(self):
+                # if part has finished
+                nonlocal with_else
+                with_else = True
+                J.Jump(label_end)
+                J.Label(label_else)
         try:
-            yield None
+            yield IfStatement()
         finally:
-            self.Label(label_end)
+            if with_else:
+                self.Label(label_end)
+            else:
+                self.Label(label_else)
 
     '''
     for setting VCC based on condition expression
@@ -1213,7 +1383,7 @@ class JIT:
                 name = src_line.split("=")[0].strip()
 
         dtype = dtype.replace("fp32","f32")
-        assert dtype in ["u32","i32","f32","bf16x2","fp16x2","bf8x4","fp8x4"]
+        assert dtype in ["u32","i32","s32","f32","bf16x2","fp16x2","bf8x4","fp8x4"]
         assert reg_type == 's' or reg_type == 'v' or reg_type == 'a'
         if isinstance(count_range, int):
             # allocate do not reuse, just increase the index
@@ -1806,7 +1976,10 @@ class JIT:
                     new_inst = Instruction(bb, f"{rtype}_add_{dtype}", loc=loc)
             else:
                 assert 0
-            new_inst(dst_expr, src0_operand, src1_operand)
+            if repr(src0_operand).startswith("v") and repr(src1_operand).startswith("s"):
+                new_inst(dst_expr, src1_operand, src0_operand)
+            else:
+                new_inst(dst_expr, src0_operand, src1_operand)
         elif expr.op == "-":
             if rtype == "s":
                 new_inst = Instruction(bb, f"{rtype}_sub_{dtype}", loc=loc)
@@ -2007,6 +2180,10 @@ class JIT:
         else:
             assert 0, f"unsupported expression {expr}"
 
+    def sgpr_div(self, sgpr_dividend, sgpr_divisor):
+        quotient = self.gpr("su32", sgpr_dividend // sgpr_divisor)
+        remainder = self.gpr("su32", sgpr_dividend - quotient * sgpr_divisor)
+        return quotient, remainder
 
     def compile_bb_expr(self, bb, expr_insts):
         for inst in expr_insts:
@@ -2233,6 +2410,9 @@ class JIT:
 
     def LDSTensor(self, shape, dtype):
         return LDSTensor(self, shape, dtype)
+    
+    def Layout(self, shape, dtype, offset_bits = 12):
+        return Layout(self, shape, dtype, offset_bits)
 
     def debug_setup(self, cond:GPRExpr):
         if self.debug_log_ptr is None:
@@ -2733,6 +2913,17 @@ class JIT:
             # Eliminate
             bb.instructions = [inst for t,inst in enumerate(bb.instructions) if t not in removed_insts]
 
+    @contextmanager
+    def view_code(self):
+        i0 = len(self.current_bb.instructions)
+        try:
+            yield 1
+        finally:
+            for i,inst in enumerate(self.current_bb.instructions):
+                if i >= i0:
+                    print(f"\t {inst} /*{i} #{inst.loc} */")
+
+
     def show_code(self):
         self.log("===================== bb")
         for bb in self.blocks:
@@ -2963,10 +3154,12 @@ r'''
         hip_func = getattr(hip, kernel_name)
         return hip_func
 
-    def div(self, x, y):
-        assert x % y == 0
-        assert x >= y
-        return x // y
+    def div(self, x, *ys):
+        for y in ys:
+            assert x % y == 0, f"{x=} {ys=}"
+            assert x >= y
+            x = x // y
+        return x
 
     def div_up(self, x, y):
         return (x + y - 1) // y
@@ -3182,6 +3375,169 @@ r'''
     def pk_f32_to_bf16(self, vdst, vsrc0, vsrc1):
         self.v_perm_b32(vdst, vsrc0, vsrc1, self.get_sgpr_const(0x03_02_07_06))
 
+    def wg_load_lds(self, lds, pdata, nbytes0, num_warps = 4, wait_barrier = True):
+        # global_load_lds_dwordx4
+        assert isinstance(nbytes0, int)
+        nbytes = nbytes0
+        offset0 = 0
+        limit_dw = self.gpr("vu32", nbytes)
+
+        warp_off_cnt = self.gpr(self.warp_id[0] * self.warp_size)
+        if self.cdna >= 4:
+            # load in DW4
+            num_load_lanes = nbytes // self.sizeof_DW4
+            nbytes -= num_load_lanes * self.sizeof_DW4
+            offset0 += num_load_lanes * self.sizeof_DW4
+
+            num_loads = self.div_up(num_load_lanes, num_warps * self.warp_size)
+            ioff = 0
+            voff = self.gpr("vu32", self.threadIdx.x[0] * self.sizeof_DW4)
+            limit_dw4 = self.gpr("vu32", nbytes - self.sizeof_DW4)
+            self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW4 + lds)
+            for i in range(num_loads):
+                ioff += num_warps * self.warp_size * self.sizeof_DW4
+                if ioff <= nbytes0:
+                    self.global_load_lds_dwordx4(voff, pdata)
+                else:
+                    with self.ExecMask(voff[0] <= limit_dw4, early_skip = False):
+                        self.global_load_lds_dwordx4(voff, pdata)
+                if i + 1 < num_loads:
+                    voff[0] += num_warps * self.warp_size * self.sizeof_DW4
+                    self.s_addk_i32("m0", num_warps * self.warp_size * self.sizeof_DW4)
+
+        if nbytes > 0:
+            # load in DW
+            assert nbytes % self.sizeof_DW == 0
+            num_loads = self.div_up(nbytes, num_warps * self.warp_size * self.sizeof_DW)
+            voff = self.gpr("vu32", offset0 + self.threadIdx.x[0] * self.sizeof_DW)
+            self.s_mov_b32("m0", warp_off_cnt * self.sizeof_DW + (lds + offset0))
+            for i in range(num_loads):
+                with self.ExecMask(voff[0] < limit_dw, early_skip = False):
+                    self.global_load_lds_dword(voff, pdata)
+                if i + 1 < num_loads:
+                    voff[0] += num_warps * self.warp_size * self.sizeof_DW
+                    self.s_addk_i32("m0", num_warps * self.warp_size * self.sizeof_DW)
+
+        if wait_barrier:
+            self.s_waitcnt(mod="vmcnt(0)")
+            self.s_barrier()
+
+    def get_mfma_loader(self, use_pre_shuffle, num_warps, M, K, vm_stride, warp_row0):
+        if use_pre_shuffle:
+            return self.get_loader_preshuffled(num_warps, M, K, vm_stride, warp_row0)
+        else:
+            return self.get_loader_row_major(num_warps, M, K, vm_stride, warp_row0)
+
+    def get_loader_preshuffled(self, num_warps, M, K, vm_stride, warp_row0):
+        # preshuffled data are in blocked layout [M//16,K//64] x [16,64]
+        # both in vmem or LDS
+        J = self
+        stride_1kb = J.div(16*vm_stride, 1024)
+        nbK = J.div(K, 64) # number of 16x64 blocks along K dimension
+        warp_k = J.warp_id[0] % nbK
+        warp_m = J.warp_id[0] // nbK
+        vmem_warp_off = warp_m * (stride_1kb * 1024) + warp_k * 1024
+        vmem_voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + vmem_warp_off)
+        lds_warp_off = J.gpr("su32", warp_m * (nbK * 1024) + warp_k * 1024)
+
+        voff = J.gpr(J.lane_id[0] * J.sizeof_DW4 + (warp_row0 // 16) * (nbK * 1024))
+        voff2 = J.gpr("vu32", voff[0] + 64*1024)
+        def ds_read_1kb(lds, vdst, m, k):
+            offset = lds + m*(nbK * 1024) + k*1024
+            if offset >= 64*1024:
+                voffset = voff2
+                offset -= 64*1024
+            else:
+                voffset = voff
+            J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
+
+        vm_load_cnt = J.div(J.div(M, 16), J.div(num_warps, nbK))
+
+        def vm_load(lds_offset, buff, vm_offset):
+            J.s_mov_b32("m0", lds_warp_off + lds_offset)
+            voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
+            for m in range(vm_load_cnt):
+                yield 1
+                buff.load_dwordx4(None, voff, 0, offset12=0)
+                J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
+                voff[0] += (num_warps//nbK)*(stride_1kb)*1024
+            #vmem_voff[0] += nbK * 1024
+
+        vm_offset_inc = nbK * 1024
+        return vm_load, vm_load_cnt, vm_offset_inc, ds_read_1kb
+
+    def get_loader_row_major(self, num_warps, M, K, vm_stride, warp_row0):
+        J = self
+        if 0:
+            # 通过下面的可视化得知swizzle可以解决读入数据使用mfma格式ds_read时潜在的bank-conflict问题
+            mfma_MN = 16
+            mfma_K = 64//mfma_MN
+            num_mfmas = K // (mfma_K * J.sizeof_DW4)
+            J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas)
+            J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_1=1)
+            J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=1)
+            J.show_mfma_in_lds(mfma_MN=mfma_MN, num_mfmas=num_mfmas, swizzle_2=2)
+            print(f"{wg_M=} {wg_K=} {M=} {K=}")
+            assert 0
+
+        # each wave load 8x128 bytes , 8 waves loads 64x128 bytes
+        lds_stride = K
+        num_lanes_per_row = J.div(lds_stride, J.sizeof_DW4)
+        num_rows_per_load = J.div(64, num_lanes_per_row)
+        warp_m_off = J.warp_id[0] * num_rows_per_load
+
+        def swizzle(row, col):
+            return (col ^ row) % num_lanes_per_row
+
+        row = J.threadIdx.x // num_lanes_per_row
+        col = J.threadIdx.x % num_lanes_per_row
+        swizzle_col = swizzle(row, col)
+        vmem_voff = J.gpr(row * vm_stride + swizzle_col * J.sizeof_DW4)
+        lds_warp_off = J.gpr("su32", warp_m_off * lds_stride)
+
+        vm_load_cnt = len(range(0, M, num_rows_per_load * num_warps))
+
+        # WG-level coorperative loader (closure & generator):
+        #   loads [M x K] bytes from specified buff+offset into lds
+        def vm_load(lds_offset, buff, vm_offset):
+            J.s_mov_b32("m0", lds_warp_off + lds_offset)
+            voff = J.gpr("vu32", vmem_voff[0] + vm_offset)
+            for m in range(0, M, 8*num_warps):
+                yield 1
+                buff.load_dwordx4(None, voff, 0, offset12=0)
+                J.s_addk_i32("m0", 64*num_warps*J.sizeof_DW4)
+                voff[0] += (num_rows_per_load * num_warps) * vm_stride
+
+        # the [M x K] bytes LDS buffer is accessed by following closure
+        # this closure using ds_read_b128 to load a 16x64 bytes MFMA data
+        # thus LDS buffer's layout is blocked as [M//16,K//64] x [16,64]
+        # each warp has its own row offsets specified in warp_row0
+        assert M % 16 == 0
+        assert K % 64 == 0
+
+        col = J.lane_id // 16
+        row = J.lane_id % 16
+        num_regs_K = J.div(K, 64)
+        voff = J.gpr(num_regs_K, "vu32")
+        voff2 = J.gpr(num_regs_K, "vu32")
+        for k in range(num_regs_K):
+            # each ds_read_b128 took 4 x DW-lanes
+            voff[k] = (row + warp_row0) * lds_stride + swizzle(row + warp_row0, col + k*4) * J.sizeof_DW4
+            # ds_read_b128's imm offset is limited to 16bits, this additional voffset handles
+            # the overflow case
+            voff2[k] = voff[k] + 64*1024
+
+        def ds_read_16x64(lds_offset, vdst, m, k):
+            offset = lds_offset + m*16*lds_stride
+            if offset >= 64*1024:
+                voffset = voff2[k]
+                offset -= 64*1024
+            else:
+                voffset = voff[k]
+            J.ds_read_b128(vdst, voffset, mod=f"offset:{offset}")
+        vm_offset_inc = K
+        return vm_load, vm_load_cnt, vm_offset_inc, ds_read_16x64
+
     def tb_swizzle(self, block_1d_id:"sgpr", M:"sgpr", wg_M:int, wg_N:int, N:int, M01:int, GroupNum:int):
         J = self
         if GroupNum <= 1 and M01 <= 1:
@@ -3224,17 +3580,24 @@ r'''
         return M_out, N_out
 
     @classmethod
-    def show_mfma_in_lds(cls, mfma_MN, num_mfmas, swizzle_1=0, swizzle_2=0):
+    def show_mfma_in_lds(cls, mfma_MN, num_mfmas, swizzle_1=0, swizzle_2=0,
+                         swizzle=None, lane_bytes = 16):
         '''
             visualize mfma lanes inside LDS
         '''
         if cls.cdna == 4:
-            lane_groups = [
-                [0,1,2,3, 12,13,14,15, 20,21,22,23, 24,25,26,27],
-                [4,5,6,7, 8,9,10,11,  16,17,18,19, 28,29,30,31],
-                [32,33,34,35, 44,45,46,47, 52,53,54,55, 56,57,58,59],
-                [36,37,38,39, 40,41,42,43, 48,49,50,51, 60,61,62,63]
-            ]
+            if lane_bytes == 16:
+                lane_groups = [
+                    [0,1,2,3, 12,13,14,15, 20,21,22,23, 24,25,26,27],
+                    [4,5,6,7, 8,9,10,11,  16,17,18,19, 28,29,30,31],
+                    [32,33,34,35, 44,45,46,47, 52,53,54,55, 56,57,58,59],
+                    [36,37,38,39, 40,41,42,43, 48,49,50,51, 60,61,62,63]
+                ]
+            else:
+                lane_groups = [
+                    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31],
+                    [32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
+                ]
             num_LDS_banks = 64
         else:
             assert cls.cdna == 3
@@ -3263,7 +3626,7 @@ r'''
             color1 = f"\033[0m"
             return f"{color0} {i:03} {color1}"
 
-        num_LDS_DW4_banks = num_LDS_banks // 4
+        num_LDS_Lane_banks = num_LDS_banks * 4 // lane_bytes
 
         assert cls.warp_size % mfma_MN == 0
         mfma_K_lanes = cls.warp_size // mfma_MN
@@ -3271,28 +3634,38 @@ r'''
         k_lanes = mfma_K_lanes * num_mfmas
 
         # assume the size of mfma lane is also DW4
-        assert num_LDS_DW4_banks % k_lanes == 0
-        mfma_rows_per_banks = num_LDS_DW4_banks // k_lanes
+        assert num_LDS_Lane_banks % k_lanes == 0
+        mfma_rows_per_banks = num_LDS_Lane_banks // k_lanes
         assert mfma_MN % mfma_rows_per_banks == 0
         num_bank_rows = mfma_MN // mfma_rows_per_banks
 
-        print(f"CDNA{cls.cdna} MFMA:{mfma_MN}x{mfma_K_lanes} 1x{num_mfmas} {num_LDS_banks=} {num_LDS_DW4_banks=} {k_lanes=} {swizzle_1=} {swizzle_2=}")
-        if swizzle_2:
+        total_bytes = mfma_MN * mfma_K_lanes * lane_bytes * num_mfmas
+
+        print(f"CDNA{cls.cdna} MFMA:{mfma_MN}x{mfma_K_lanes} 1x{num_mfmas} {total_bytes//1024}KB {num_LDS_banks=} {num_LDS_Lane_banks=} {k_lanes=} {swizzle_1=} {swizzle_2=}")
+        if swizzle_2 > 0:
             print(f"\t  logical_col = (logical_col ^ (logical_row // {swizzle_2})) % {k_lanes}")
-        bank_lg = [list() for bank_col in range(num_LDS_DW4_banks)]
+        if swizzle_2 < 0:
+            print(f"\t  logical_col = (logical_col ^ (logical_row * {-swizzle_2})) % {k_lanes}")
+        bank_lg = [list() for bank_col in range(num_LDS_Lane_banks)]
         for bank_row in range(num_bank_rows):
-            for bank_col in range(num_LDS_DW4_banks):
+            for bank_col in range(num_LDS_Lane_banks):
                 row = bank_row
                 # swizzle is done in term of LDS bank rows & cols
                 if swizzle_1:
-                    col = (bank_col ^ row) % num_LDS_DW4_banks
+                    col = (bank_col ^ row) % num_LDS_Lane_banks
                 else:
                     col = bank_col
 
                 logical_row = (row * mfma_rows_per_banks + col//k_lanes)
                 logical_col = col % k_lanes
-                if swizzle_2:
+
+                if swizzle_2 > 0:
                     logical_col = (logical_col ^ (logical_row // swizzle_2)) % k_lanes
+                elif swizzle_2 < 0:
+                    logical_col = (logical_col ^ (logical_row * (-swizzle_2))) % k_lanes
+
+                #if swizzle:
+                #    logical_col = swizzle(logical_row, logical_col)
                 # at physical location (r0,c0)
                 # 
                 i0 = logical_col*mfma_MN + logical_row
@@ -3302,7 +3675,7 @@ r'''
                 print(lane_str(i0),end="")
             print("")
 
-        for bank in range(num_LDS_DW4_banks):
+        for bank in range(num_LDS_Lane_banks):
             conflict = 0
             for lg in set(bank_lg[bank]):
                 c = bank_lg[bank].count(lg)
@@ -3579,16 +3952,3 @@ class jit:
 
     def __call__(self, gen_func):
         return jit_kernel(gen_func, self.extra_compiler_options, self.with_debug_log, self.dump_stat, self.force_recompile, self.no_pass)
-
-class Addr2D:
-    def __init__(self, J:JIT, base, row_init, col_init, stride):
-        self.vaddr = J.gpr('vu32')
-        # TODO: use shift to simplify
-        # TODO: remove zero add/mul
-        if isinstance(base, int) and base == 0:
-            self.vaddr[0] = row_init * stride + col_init
-        else:
-            self.vaddr[0] = base + row_init * stride + col_init
-
-    def get_addr(self):
-        return self.vaddr

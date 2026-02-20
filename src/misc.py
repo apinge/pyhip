@@ -1,5 +1,8 @@
-from .hiptools import module
-from .asmjit import jit, JIT
+""" Some useful helpers """
+
+__all__ = [
+    'cudaPerf', 'torchPerf', 'calc_diff', 'div_up', "pre_shuffle"
+]
 
 class cudaPerf(object):
     def __init__(self, flops = 0, rw_bytes = 0, name="", verbose=1):
@@ -73,40 +76,33 @@ class torchPerf(object):
             self.profiler.stop()
             print(self.profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
-class cuPerf(object):
-    def __init__(self, flops = 0, batch = 0, rw_bytes = 0, name="", filter=None, verbose=1):
-        global torch
-        import torch
-        self.is_enabled = (filter is None) or (name.startswith(filter))
-        if self.is_enabled :
-            self.filter = filter
-            self.flops = flops
-            self.name = name
-            self.batch = batch
-            self.verbose = verbose
-            self.rw_bytes = rw_bytes
-            self.ev_start = torch.cuda.Event(enable_timing=True)
-            self.ev_end = torch.cuda.Event(enable_timing=True)
-            self.latencies = []
+# type-less preshuffle
+def pre_shuffle(x, mfma_MN):
+    M, K = x.shape
+    K_bytes = K * x.itemsize
+    sizeof_DW4 = 16
+    mfma_K_lanes = 64 // mfma_MN
+    mfma_K_L = sizeof_DW4//x.itemsize
+    mfma_K = mfma_K_lanes * mfma_K_L 
 
-    def __enter__(self):
-        if self.is_enabled:
-            torch.cuda._sleep(1_000_000)
-            self.ev_start.record()
-        return self
+    assert M % mfma_MN == 0
+    mfma_K_bytes = mfma_K_lanes * sizeof_DW4
+    assert K_bytes % mfma_K_bytes == 0
 
-    def __exit__(self, type, value, traceback):
-        if self.is_enabled:
-            self.ev_end.record()
-            torch.cuda.synchronize()
-            self.dt_ms = self.ev_start.elapsed_time(self.ev_end)
-            msg = f"{self.name} dt = {self.dt_ms*1e3:.3f} us"
-            if self.batch > 0:
-                msg += f"  {self.dt_ms/self.batch:.3f} ms/item x {self.batch} "
-            if self.flops and self.flops > 0:
-                msg += f"  {self.flops*1e-9/self.dt_ms:.1f} TFLOPS "
-            if self.rw_bytes and self.rw_bytes > 0:
-                msg += f"  {self.rw_bytes*1e-6/self.dt_ms:.1f} GB/s "
-            print(msg)
+    x = x.reshape(M//mfma_MN, mfma_MN, K//mfma_K, mfma_K_lanes, mfma_K_L)
+    x = x.permute(0,2,3,1,4)
+    return x.contiguous()
 
-from .kernels import *
+# https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/testing/numeric.py#L5
+def calc_diff(x: "torch.Tensor", y: "torch.Tensor"):
+    x, y = x.double(), y.double()
+    denominator = (x * x + y * y).sum()
+    if denominator == 0:    # Which means that all elements in x and y are 0
+        return 0.0
+    sim = 2 * (x * y).sum() / denominator
+    diff = (1 - sim).item()
+    assert diff == diff, "diff is nan!"
+    return diff
+
+def div_up(x, y):
+    return (x + y - 1) // y
