@@ -182,7 +182,99 @@ def test_mfma_32x32x8_bf16():
         print(C)
     else:
         print("PASS: test_mfma_32x32x8")
+
+
+def test_mfma_32x32x16_fp8():
+    """
+    C = A @ B^T，A 32x16 fp8，B 32x16 fp8，C 32x32 f32。
+    hip version be like:
+    __global__ void mfma_fp32_32x32x16_fp8_fp8(const fp8_t* A, const fp8_t* B, float* C) {
+        fp8x8_t a_reg;
+        fp8x8_t b_reg;
+        fp32x16_t_fp8 c_reg {};
+
+        a_reg = *reinterpret_cast<const fp8x8_t*>(A + (threadIdx.x / 32) * 8 + (threadIdx.x % 32) * 16);
+        b_reg = *reinterpret_cast<const fp8x8_t*>(B + (threadIdx.x / 32) * 8 + (threadIdx.x % 32) * 16);
+      
+        c_reg = __builtin_amdgcn_mfma_f32_32x32x16_fp8_fp8((long)a_reg, (long)b_reg, c_reg, 0, 0, 0);
+
+        for (int i = 0; i < 4; i++) {
+            C[threadIdx.x % 32 + (threadIdx.x / 32) * 4 * 32 + i * 32 * 8]          = c_reg[i * 4];
+            C[threadIdx.x % 32 + (threadIdx.x / 32) * 4 * 32 + 32 * 1 + i * 32 * 8] = c_reg[i * 4 + 1];
+            C[threadIdx.x % 32 + (threadIdx.x / 32) * 4 * 32 + 32 * 2 + i * 32 * 8] = c_reg[i * 4 + 2];
+            C[threadIdx.x % 32 + (threadIdx.x / 32) * 4 * 32 + 32 * 3 + i * 32 * 8] = c_reg[i * 4 + 3];
+        }
+    }
+    
+    """
+    arch = torch.cuda.get_device_properties().gcnArchName
+    if "gfx942" in arch:
+        A = torch.randn(32, 16, device="cuda").to(torch.float8_e4m3fnuz)
+        B = torch.randn(32, 16, device="cuda").to(torch.float8_e4m3fnuz)
+    elif "gfx950" in arch:
+        A = torch.randn(32, 16, device="cuda").to(torch.float8_e4m3fn)
+        B = torch.randn(32, 16, device="cuda").to(torch.float8_e4m3fn)
+    else:
+        print("SKIP: test_mfma_32x32x16_fp8 (no torch.float8_e4m3fnuz or torch.float8_e4m3fn)")
+        return
+
+    @pyhip.jit()
+    def mfma_32x32x16_fp8(J: pyhip.JIT,
+           pA: "void*",
+           pB: "void*",
+           pC: "void*"):
+
+        warp_id = J.gpr("su32")
+        J.v_readfirstlane_b32(warp_id, J.threadIdx.x[0] // 64)
+
+        lane_id = J.gpr(J.threadIdx.x[0] % 64)
+
+        r = J.gpr(lane_id &31) #lane_id %32
+        cblock = J.gpr(lane_id >> 5) #lane_id /32
+
+   
+        A_buf = J.Buffer(pA, 32 * 16 * 1)
+        B_buf = J.Buffer(pB, 32 * 16 * 1)
+        C_buf = J.Buffer(pC, 32 * 32 * 4)
+
+        a_frag = J.gpr(2, "vu32")   
+        b_frag = J.gpr(2, "vu32")
+
+        voffset = J.gpr(cblock * 8 + r * 16)
+        # voffset = voffset << 1
+        A_buf.load_dwordx2(a_frag, voffset, 0)       
+        B_buf.load_dwordx2(b_frag, voffset, 0)
+        J.s_waitcnt(mod="vmcnt(0)")
+
+        c_frag = J.gpr(16, "f32")
+
+        J.v_mfma_f32_32x32x16_fp8_fp8(
+            c_frag,
+            a_frag,
+            b_frag,
+            0
+        )
+        base_offset = J.gpr(r + cblock * 4 * 32)
+        base_offset = base_offset << 2
+        for i in range(4):
+            C_buf.store_dword(c_frag[i*4+0], base_offset, 0, offset12=i*256*4 + 0)
+            C_buf.store_dword(c_frag[i*4+1], base_offset, 0, offset12=i*256*4 + 128)
+            C_buf.store_dword(c_frag[i*4+2], base_offset, 0, offset12=i*256*4 + 256)
+            C_buf.store_dword(c_frag[i*4+3], base_offset, 0, offset12=i*256*4 + 384)
+        return
+
+    C = torch.zeros(32, 32, dtype=torch.float32, device="cuda")
+    mfma_32x32x16_fp8([1], [64], A.data_ptr(), B.data_ptr(), C.data_ptr())
+    torch.cuda.synchronize()
+    ref = torch.mm(A.to(torch.float32), B.to(torch.float32).T)
+    if not torch.allclose(ref, C, atol=0.1, rtol=0.1):
+        print("ref (sample):", ref[:4, :4])
+        print("C (sample):", C[:4, :4])
+    else:
+        print("PASS: test_mfma_32x32x16_fp8")
+
+
 if __name__ == "__main__":
-    #test_mfma_32x32x16(32*2, 32*2, 16)
     test_mfma_16x16x16_bf16()
     test_mfma_32x32x8_bf16()
+    test_mfma_32x32x16_fp8()
