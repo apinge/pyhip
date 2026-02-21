@@ -7,7 +7,8 @@ torch.manual_seed(0)
 from functools import cache
 
 """
-本例为最简单的 单个mfma的patten的写法
+本例为最简单的 单个mfma的pattern的写法
+mfma pattern 有一定规律可循
 图可以参考 https://rocm.blogs.amd.com/software-tools-optimization/matrix-cores-cdna/README.html
 """
 def test_mfma_16x16x16_bf16():
