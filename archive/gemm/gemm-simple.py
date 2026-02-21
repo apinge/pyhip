@@ -10,6 +10,11 @@ if torch.cuda.is_available():
     torch.set_default_device("cuda")
 torch.manual_seed(0)
 
+
+def get_current_arch():
+    return torch.cuda.get_device_properties().gcnArchName
+
+
 hip = pyhip.module("gemm-simple.cpp")
 
 def run_and_check(name, A, B, C, kernel, grid, block, atol=1e-2, rtol=1e-2):
@@ -95,12 +100,17 @@ def test_sgemm_fp32_32x32x8_fp16():
 # FP8 32x32x16: A 32x16, B 16x32, C 32x32（需 GPU 支持 FP8）
 # ---------------------------------------------------------------------------
 def test_mfma_fp32_32x32x16_fp8():
-    if not hasattr(torch, "float8_e4m3fn"):
-        print("mfma_fp32_32x32x16_fp8_fp8: SKIP (no torch.float8_e4m3fn)")
-        return
     try:
-        A = torch.randn(32, 16, device="cuda").to(torch.float8_e4m3fn)
-        B = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fn)
+        arch = get_current_arch()
+        if "gfx942" in arch:
+            A = torch.randn((32,16), device="cuda").to(torch.float8_e4m3fnuz) # for cdna3
+            B = torch.randn((16,32), device="cuda").to(torch.float8_e4m3fnuz) # for cnda3
+        elif "gfx950" in arch:
+            A = torch.randn((32,16), device="cuda").to(torch.float8_e4m3fn) # for cdna4
+            B = torch.randn((16,32), device="cuda").to(torch.float8_e4m3fn) # for cnda4
+        else:
+            print("mfma_fp32_32x32x16_fp8_fp8: SKIP (no torch.float8_e4m3fnuz or torch.float8_e4m3fn)")
+            return
         print(A.is_contiguous())
         print(B.is_contiguous())
     except Exception as e:
