@@ -240,7 +240,7 @@ __global__ void mfma_fp32_32x32x16_fp8_fp8(const fp8_t* A, const fp8_t* B, float
 }
 
 /*
-A (B^T) is logically 32 x 16  (M=16, K=43)
+A (B^T) is logically 32 x 16  
 
 
 0   :  0 0 0 0 0 0 0 0 | 16 16 16 16 16 16 16 16 | 32 32 32 32 32 32 32 32 | 48 48 48 48 48 48 48 48
