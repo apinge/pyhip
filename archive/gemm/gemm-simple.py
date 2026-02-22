@@ -97,9 +97,36 @@ def test_sgemm_fp32_32x32x8_fp16():
     run_and_check("mfma_fp32_32x32x8_fp16", A, B, C, hip.mfma_fp32_32x32x8_fp16, [1], [64])
 
 # ---------------------------------------------------------------------------
-# FP8 32x32x16: A 32x16, B 16x32, C 32x32（需 GPU 支持 FP8）
+# FP8 16x16x32 A_BT: A 16x32, B 16x32, C = A @ B^T 16x16
+# ---------------------------------------------------------------------------
+def test_mfma_fp32_16x16x32_fp8_fp8_A_BT():
+    if not hasattr(torch, "float8_e4m3fnuz"):
+        print("mfma_fp32_16x16x32_fp8_fp8_A_BT: SKIP (no torch.float8_e4m3fnuz)")
+        return
+    try:
+        arch = get_current_arch()
+        if "gfx942" in arch:
+            A = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fnuz)
+            B = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fnuz)
+        elif "gfx950" in arch:
+            A = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fn)
+            B = torch.randn(16, 32, device="cuda").to(torch.float8_e4m3fn)
+        else:
+            print("mfma_fp32_16x16x32_fp8_fp8_A_BT: SKIP (arch not gfx942/gfx950)")
+            return
+    except Exception as e:
+        print("mfma_fp32_16x16x32_fp8_fp8_A_BT: SKIP", e)
+        return
+    C = torch.zeros(16, 16, dtype=torch.float32, device="cuda")
+    run_and_check("mfma_fp32_16x16x32_fp8_fp8_A_BT", A, B, C, hip.mfma_fp32_16x16x32_fp8_fp8_A_BT, [1], [64])
+
+# ---------------------------------------------------------------------------
+# FP8 32x32x16: A 32x16, B 16x32, C 32x32
 # ---------------------------------------------------------------------------
 def test_mfma_fp32_32x32x16_fp8():
+    if not hasattr(torch, "float8_e4m3fnuz"):
+        print("mfma_fp32_32x32x16_fp8_fp8: SKIP (no torch.float8_e4m3fnuz)")
+        return
     try:
         arch = get_current_arch()
         if "gfx942" in arch:
@@ -123,9 +150,11 @@ def test_mfma_fp32_32x32x16_fp8():
 # 全部运行
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
+
     test_mfma_fp32_32x32x2()
     test_mfma_fp32_16x16x16_fp16()
     test_mfma_fp32_16x16x16_fp16_A_BT()
     test_sgemm_fp32_32x32x8_fp16_A_BT()
     test_sgemm_bf16_simple()
+    test_mfma_fp32_16x16x32_fp8_fp8_A_BT()
     test_mfma_fp32_32x32x16_fp8()
