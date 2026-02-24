@@ -21,9 +21,6 @@ def test_mfma_16x16x16_bf16():
 
         a_reg = *reinterpret_cast<const fp16x4_t*>(A + 4 * (threadIdx.x / 16) + 16 * (threadIdx.x % 16));
         b_reg = *reinterpret_cast<const fp16x4_t*>(B + 4 * (threadIdx.x / 16) + 16 * (threadIdx.x % 16));
-        // for (int i = 0; i < 4; i++) {
-        //     b_reg[i] = *(B + i * 16 + threadIdx.x % 16 + (threadIdx.x / 16) * 64);
-        // }
 
         c_reg = __builtin_amdgcn_mfma_f32_16x16x16f16(a_reg, b_reg, c_reg, 0, 0, 0);
 
@@ -91,7 +88,7 @@ def test_mfma_16x16x16_bf16():
         print("===================")
         print(C)
     else:
-        print("PASS: test_mfma_16x16x16")
+        print("PASS: test_mfma_16x16x16_bf16")
 
 
 def test_mfma_32x32x8_bf16():
@@ -181,7 +178,7 @@ def test_mfma_32x32x8_bf16():
         print("===================")
         print(C)
     else:
-        print("PASS: test_mfma_32x32x8")
+        print("PASS: test_mfma_32x32x8_bf16")
 
 
 def test_mfma_32x32x16_fp8():
