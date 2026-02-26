@@ -42,42 +42,50 @@ def _grid_block_smem_fused(batch_size, hidden_size):
 
 
 def gemma_rmsnorm(output, input_tensor, weight, eps=1e-6, enable_pdl=False, stream=None):
-    """Gemma-style RMSNorm: output = (input / RMS(input)) * (1 + weight). All fp16, contiguous."""
+    """Gemma-style RMSNorm: output = (input / RMS(input)) * (1 + weight). fp16 or bf16, contiguous."""
     (enable_pdl,)  # unused on HIP
     assert output.is_contiguous() and input_tensor.is_contiguous() and weight.is_contiguous()
-    assert output.dtype == torch.float16 and input_tensor.dtype == torch.float16 and weight.dtype == torch.float16
+    assert output.dtype == input_tensor.dtype == weight.dtype
+    assert output.dtype in (torch.float16, torch.bfloat16)
     batch_size, hidden_size = input_tensor.shape
     grid, block, smem = _grid_block_smem_rmsnorm(batch_size, hidden_size)
     eps_f = float(eps)
-    hip.gemma_rmsnorm_fp16(
-        grid, block,
-        output.data_ptr(),
-        input_tensor.data_ptr(),
-        weight.data_ptr(),
-        hidden_size,
-        eps_f,
-        sharedMemBytes=smem,
-    )
+    if output.dtype == torch.float16:
+        hip.gemma_rmsnorm_fp16(
+            grid, block,
+            output.data_ptr(), input_tensor.data_ptr(), weight.data_ptr(),
+            hidden_size, eps_f, sharedMemBytes=smem,
+        )
+    else:
+        hip.gemma_rmsnorm_bf16(
+            grid, block,
+            output.data_ptr(), input_tensor.data_ptr(), weight.data_ptr(),
+            hidden_size, eps_f, sharedMemBytes=smem,
+        )
     return output
 
 
 def gemma_fused_add_rmsnorm(input_tensor, residual, weight, eps=1e-6, enable_pdl=False, stream=None):
-    """residual += input; input = (residual / RMS(residual)) * (1 + weight). In-place."""
+    """residual += input; input = (residual / RMS(residual)) * (1 + weight). In-place. fp16 or bf16."""
     (enable_pdl,)  # unused on HIP
     assert input_tensor.is_contiguous() and residual.is_contiguous() and weight.is_contiguous()
-    assert input_tensor.dtype == torch.float16 and residual.dtype == torch.float16 and weight.dtype == torch.float16
+    assert input_tensor.dtype == residual.dtype == weight.dtype
+    assert input_tensor.dtype in (torch.float16, torch.bfloat16)
     batch_size, hidden_size = input_tensor.shape
     grid, block, smem = _grid_block_smem_fused(batch_size, hidden_size)
     eps_f = float(eps)
-    hip.gemma_fused_add_rmsnorm_fp16(
-        grid, block,
-        input_tensor.data_ptr(),
-        residual.data_ptr(),
-        weight.data_ptr(),
-        hidden_size,
-        eps_f,
-        sharedMemBytes=smem,
-    )
+    if input_tensor.dtype == torch.float16:
+        hip.gemma_fused_add_rmsnorm_fp16(
+            grid, block,
+            input_tensor.data_ptr(), residual.data_ptr(), weight.data_ptr(),
+            hidden_size, eps_f, sharedMemBytes=smem,
+        )
+    else:
+        hip.gemma_fused_add_rmsnorm_bf16(
+            grid, block,
+            input_tensor.data_ptr(), residual.data_ptr(), weight.data_ptr(),
+            hidden_size, eps_f, sharedMemBytes=smem,
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -108,7 +116,7 @@ def _gemma_fused_add_rms_norm_ref(x, residual, w, eps=1e-6):
 # -----------------------------------------------------------------------------
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [4096])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("specify_out", [True, False])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
@@ -133,12 +141,13 @@ def test_gemma_norm(batch_size, hidden_size, dtype, specify_out, enable_pdl, con
         gemma_rmsnorm(y, x_in, w, eps=eps, enable_pdl=enable_pdl)
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(y_ref, y, rtol=1e-3, atol=1e-3)
+    rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    torch.testing.assert_close(y_ref, y, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])
 @pytest.mark.parametrize("hidden_size", [4096])
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("enable_pdl", [True, False])
 @pytest.mark.parametrize("contiguous", [True, False])
 def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, contiguous):
@@ -161,8 +170,9 @@ def test_gemma_fused_add_rmsnorm(batch_size, hidden_size, dtype, enable_pdl, con
     gemma_fused_add_rmsnorm(x_fused, residual_fused, weight, eps=eps, enable_pdl=enable_pdl)
 
     torch.cuda.synchronize()
-    torch.testing.assert_close(x_fused, x_native, rtol=1e-3, atol=1e-3)
-    torch.testing.assert_close(residual_fused, residual_native, rtol=1e-3, atol=1e-3)
+    rtol, atol = (1e-2, 1e-2) if dtype == torch.bfloat16 else (1e-3, 1e-3)
+    torch.testing.assert_close(x_fused, x_native, rtol=rtol, atol=atol)
+    torch.testing.assert_close(residual_fused, residual_native, rtol=rtol, atol=atol)
 
 
 # -----------------------------------------------------------------------------
@@ -173,7 +183,9 @@ if __name__ == "__main__":
     torch.set_default_device("cuda")
     torch.manual_seed(42)
 
-    # Quick smoke
+    # Quick smoke (fp16 + bf16)
     test_gemma_norm(1, 1024, torch.float16, False, False, True)
     test_gemma_fused_add_rmsnorm(1, 1024, torch.float16, False, True)
+    test_gemma_norm(1, 1024, torch.bfloat16, False, False, True)
+    test_gemma_fused_add_rmsnorm(1, 1024, torch.bfloat16, False, True)
     print("All tests passed.")
