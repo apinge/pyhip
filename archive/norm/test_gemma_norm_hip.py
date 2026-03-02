@@ -18,13 +18,16 @@ os.chdir(_SCRIPT_DIR)
 hip = pyhip.module("gemma_norm_hip.cpp")
 
 
+WARP_SIZE = 64
+
+
 def _grid_block_smem_rmsnorm(batch_size, hidden_size):
-    """Match GemmaRMSNorm: vec_size=8, block = (32, num_warps), smem = num_warps * 4."""
+    """Match GemmaRMSNorm: vec_size=8, block = (WARP_SIZE, num_warps), smem = num_warps * 4."""
     vec_size = 8
     block_size = min(1024, hidden_size // vec_size)
-    num_warps = (block_size + 31) // 32
+    num_warps = (block_size + WARP_SIZE - 1) // WARP_SIZE
     grid = [batch_size, 1, 1]
-    block = [32, num_warps, 1]
+    block = [WARP_SIZE, num_warps, 1]
     smem = num_warps * 4  # float
     return grid, block, smem
 
@@ -33,11 +36,11 @@ def _grid_block_smem_fused(batch_size, hidden_size):
     """Match GemmaFusedAddRMSNorm: smem = (padded_warps + hidden_size) * 4."""
     vec_size = 8
     block_size = min(1024, hidden_size // vec_size)
-    num_warps = (block_size + 31) // 32
+    num_warps = (block_size + WARP_SIZE - 1) // WARP_SIZE
     padded_warps = ((num_warps + 3) // 4) * 4
     smem = (padded_warps + hidden_size) * 4
     grid = [batch_size, 1, 1]
-    block = [32, num_warps, 1]
+    block = [WARP_SIZE, num_warps, 1]
     return grid, block, smem
 
 
@@ -49,6 +52,7 @@ def gemma_rmsnorm(output, input_tensor, weight, eps=1e-6, enable_pdl=False, stre
     assert output.dtype in (torch.float16, torch.bfloat16)
     batch_size, hidden_size = input_tensor.shape
     grid, block, smem = _grid_block_smem_rmsnorm(batch_size, hidden_size)
+    #print(f"[rmsnorm] batch_size={batch_size}, hidden_size={hidden_size} -> grid={grid}, block={block}, smem={smem}")
     eps_f = float(eps)
     if output.dtype == torch.float16:
         hip.gemma_rmsnorm_fp16(
@@ -73,6 +77,7 @@ def gemma_fused_add_rmsnorm(input_tensor, residual, weight, eps=1e-6, enable_pdl
     assert input_tensor.dtype in (torch.float16, torch.bfloat16)
     batch_size, hidden_size = input_tensor.shape
     grid, block, smem = _grid_block_smem_fused(batch_size, hidden_size)
+    #print(f"[fused_add_rmsnorm] batch_size={batch_size}, hidden_size={hidden_size} -> grid={grid}, block={block}, smem={smem}")
     eps_f = float(eps)
     if input_tensor.dtype == torch.float16:
         hip.gemma_fused_add_rmsnorm_fp16(
@@ -184,8 +189,8 @@ if __name__ == "__main__":
     torch.manual_seed(42)
 
     # Quick smoke (fp16 + bf16)
-    test_gemma_norm(1, 1024, torch.float16, False, False, True)
-    test_gemma_fused_add_rmsnorm(1, 1024, torch.float16, False, True)
-    test_gemma_norm(1, 1024, torch.bfloat16, False, False, True)
-    test_gemma_fused_add_rmsnorm(1, 1024, torch.bfloat16, False, True)
+    test_gemma_norm(1, 4096, torch.float16, False, False, True)
+    test_gemma_fused_add_rmsnorm(1, 4096, torch.float16, False, True)
+    test_gemma_norm(1, 4096, torch.bfloat16, False, False, True)
+    test_gemma_fused_add_rmsnorm(1, 4096, torch.bfloat16, False, True)
     print("All tests passed.")

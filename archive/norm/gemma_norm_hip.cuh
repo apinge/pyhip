@@ -32,13 +32,16 @@ __forceinline__ __device__ float rsqrt(float x) {
   return __frsqrt_rn(x);
 }
 
+constexpr uint32_t WARP_SIZE = 64;
+
 __forceinline__ __device__ float shfl_xor_sync(float x, int lane_mask) {
-  return __shfl_xor(x, lane_mask, 32);
+  return __shfl_xor(x, lane_mask, WARP_SIZE);
 }
 
-/* ----- vec_t half 1,2,4,8 (HIP __half) ----- */
+/* ----- vec_t half 1,2,4,8 (HIP __half). Only 8 used by gemma_norm_hip.cpp ----- */
 template <size_t N>
 struct vec_t_half;
+#if 0  /* unused by .cpp (pyhip path): vec_t_half<1>,<2>,<4> */
 template <>
 struct vec_t_half<1> {
   __half data;
@@ -67,6 +70,7 @@ struct vec_t_half<4> {
   __device__ __forceinline__ void load(const __half* ptr) { data = *((uint2*)ptr); }
   __device__ __forceinline__ void store(__half* ptr) const { *((uint2*)ptr) = data; }
 };
+#endif
 template <>
 struct vec_t_half<8> {
   int4 data;
@@ -98,6 +102,7 @@ struct vec_t_float {
   }
 };
 
+#if 0  /* unused by gemma_norm_hip.cpp (pyhip path uses its own __global__ kernels) */
 template <uint32_t VEC_SIZE>
 __global__ void RMSNormKernel(__half* __restrict__ input, __half* __restrict__ weight,
                               __half* __restrict__ output, const uint32_t d,
@@ -105,7 +110,7 @@ __global__ void RMSNormKernel(__half* __restrict__ input, __half* __restrict__ w
                               float weight_bias, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = WARP_SIZE;
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -173,7 +178,7 @@ __global__ void FusedAddRMSNormKernel(__half* __restrict__ input, __half* __rest
                                       float weight_bias, float eps) {
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = WARP_SIZE;
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -282,12 +287,12 @@ inline hipError_t GemmaRMSNorm(__half* input, __half* weight, __half* output,
   (void)enable_pdl;  // HIP has no PDL equivalent
   const uint32_t vec_size = std::gcd(16u / sizeof(__half), d);
   const uint32_t block_size = std::min(1024u, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32u);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   const uint32_t smem_size = num_warps * sizeof(float);
   const float weight_bias = 1.f;
 
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
 
   DISPATCH_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = RMSNormKernel<VEC_SIZE>;
@@ -308,12 +313,12 @@ inline hipError_t GemmaFusedAddRMSNorm(__half* input, __half* residual, __half* 
   (void)enable_pdl;
   const uint32_t vec_size = std::gcd(16u / sizeof(__half), d);
   const uint32_t block_size = std::min(1024u, d / vec_size);
-  const uint32_t num_warps = ceil_div(block_size, 32u);
+  const uint32_t num_warps = ceil_div(block_size, WARP_SIZE);
   const uint32_t smem_size = (ceil_div(num_warps, 4u) * 4 + d) * sizeof(float);
   const float weight_bias = 1.f;
 
   dim3 nblks(batch_size);
-  dim3 nthrs(32, num_warps);
+  dim3 nthrs(WARP_SIZE, num_warps);
 
   DISPATCH_VEC_SIZE(vec_size, VEC_SIZE, {
     auto kernel = FusedAddRMSNormKernel<VEC_SIZE>;
@@ -326,6 +331,7 @@ inline hipError_t GemmaFusedAddRMSNorm(__half* input, __half* residual, __half* 
   });
   return hipSuccess;
 }
+#endif  /* unused: host launch path used only by .hip */
 
 }  // namespace gemma_norm
 

@@ -10,6 +10,8 @@
 
 namespace gemma_norm {
 
+/* Unused by test (test uses pyhip.module("gemma_norm_hip.cpp") which compiles .cpp, not .hip). */
+#if 0
 extern "C" hipError_t gemma_rmsnorm_fp16(__half* output, const __half* input, const __half* weight,
                                           uint32_t batch_size, uint32_t hidden_size, double eps,
                                           bool enable_pdl, hipStream_t stream) {
@@ -30,5 +32,6 @@ extern "C" hipError_t gemma_fused_add_rmsnorm_fp16(__half* input, __half* residu
                               hidden_size, hidden_size, hidden_size, static_cast<float>(eps), false,
                               stream);
 }
+#endif
 
 }  // namespace gemma_norm

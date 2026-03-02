@@ -10,7 +10,7 @@
 
 constexpr uint32_t VEC_SIZE = 8;
 
-// Gemma RMSNorm: one block per row. grid = (batch_size), block = (32, num_warps).
+// Gemma RMSNorm: one block per row. grid = (batch_size), block = (WARP_SIZE, num_warps). A-card warp=64.
 // output = (input / RMS(input)) * (1 + weight). Strides = hidden_size.
 __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
                                     const __half* __restrict__ input,
@@ -23,7 +23,7 @@ __global__ void gemma_rmsnorm_fp16(__half* __restrict__ output,
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = 64;  
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -96,7 +96,7 @@ __global__ void gemma_fused_add_rmsnorm_fp16(__half* __restrict__ input,
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = 64; 
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -193,7 +193,7 @@ __global__ void gemma_rmsnorm_bf16(__bf16* __restrict__ output,
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = 64; 
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
@@ -267,7 +267,7 @@ __global__ void gemma_fused_add_rmsnorm_bf16(__bf16* __restrict__ input,
 
   const uint32_t bx = blockIdx.x;
   const uint32_t tx = threadIdx.x, ty = threadIdx.y;
-  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t warp_size = 64;  
   const uint32_t num_warps = blockDim.y;
   const uint32_t thread_id = tx + ty * warp_size;
   const uint32_t num_threads = num_warps * warp_size;
