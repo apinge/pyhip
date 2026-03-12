@@ -225,6 +225,8 @@ L_N = [256, 4096]
 
 # Perf test: buffer rotation like test-pa.py
 BUF_COPY = 8
+# Warmup iters before timed perf (reduces single-shape vs full-sweep variance: GPU freq, cache, driver state)
+PERF_WARMUP_ITERS = 20
 
 
 def _rw_bytes_rmsnorm(m, n, elem_bytes=2):
@@ -270,6 +272,13 @@ def run_perf_rmsnorm(dtype, m, n, num_iters=10):
     inputs = [torch.randn(dim, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
     weights = [torch.randn(n, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
     outputs = [torch.empty(dim, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
+    # Warmup so single-shape run matches full-sweep (GPU freq/cache steady)
+    for _ in range(PERF_WARMUP_ITERS):
+        run_torch(inputs[0], weights[0], 1e-6)
+        gemma_rmsnorm(outputs[0], inputs[0], weights[0], eps=1e-6)
+        if AITER_AVAILABLE:
+            run_aiter_rmsnorm(inputs[0], weights[0], 1e-6)
+    torch.cuda.synchronize()
     i = 0
     latencies_torch = []
     for _ in range(num_iters):
@@ -319,6 +328,15 @@ def run_perf_fused_add_rmsnorm(dtype, m, n, num_iters=10):
     inputs = [torch.randn(dim, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
     residuals = [torch.randn(dim, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
     weights = [torch.randn(n, dtype=dtype, device="cuda") for _ in range(BUF_COPY)]
+    # Warmup so single-shape run matches full-sweep (GPU freq/cache steady)
+    for _ in range(PERF_WARMUP_ITERS):
+        run_torch(inputs[0], weights[0], 1e-6, residual=residuals[0])
+        out = inputs[0].clone()
+        res_out = residuals[0].clone()
+        gemma_fused_add_rmsnorm(out, res_out, weights[0], eps=1e-6)
+        if AITER_AVAILABLE:
+            run_aiter_fused_add_rmsnorm(inputs[0].clone(), residuals[0].clone(), weights[0], 1e-6)
+    torch.cuda.synchronize()
     i = 0
     latencies_torch = []
     for _ in range(num_iters):
