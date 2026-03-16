@@ -214,7 +214,7 @@ def naive_recurrent_gated_delta_rule(
     if initial_state is not None:
         h = initial_state.to(torch.float32)
         # 走了这个分支
-        # 这里的H就是公式里的S，表示memory的状态
+        # 这里的H就是公式里的S的transpose，表示memory的状态
         # [naive_recurrent_gated_delta_rule] initial_state set: h.shape=torch.Size([8, 128, 128])
         
 
