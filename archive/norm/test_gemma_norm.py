@@ -303,7 +303,7 @@ def run_perf_rmsnorm(dtype, m, n, num_iters=10):
     dtype_str = "fp16" if dtype == torch.float16 else "bf16"
     line = (
         f"[perf rmsnorm] dim={dim} dtype={dtype_str}: "
-        f"torch {avg_torch_us:.2f} us, gemma(ours) {avg_gemma_us:.2f} us {gemma_tflops:.2f} TFLOPS (vs torch {speedup_gemma:.2f}x)"
+        f"torch {avg_torch_us:.2f} us, gemma(ours) {avg_gemma_us:.2f} us {gemma_tflops:.2f} TFLOPS"
     )
     if AITER_AVAILABLE:
         i = 0
@@ -316,7 +316,7 @@ def run_perf_rmsnorm(dtype, m, n, num_iters=10):
         avg_aiter_us = sum(latencies_aiter) / num_iters
         speedup_aiter = avg_torch_us / avg_aiter_us if avg_aiter_us > 0 else 0.0
         gemma_vs_aiter = avg_aiter_us / avg_gemma_us if avg_gemma_us > 0 else 0.0
-        line += f", aiter {avg_aiter_us:.2f} us (vs torch {speedup_aiter:.2f}x), gemma/aiter {gemma_vs_aiter:.2f}x"
+        line += f", aiter {avg_aiter_us:.2f} us, gemma/aiter {gemma_vs_aiter:.2f}x"
     print(line)
 
 
@@ -363,7 +363,7 @@ def run_perf_fused_add_rmsnorm(dtype, m, n, num_iters=10):
     dtype_str = "fp16" if dtype == torch.float16 else "bf16"
     line = (
         f"[perf fused_add_rmsnorm] dim={dim} dtype={dtype_str}: "
-        f"torch {avg_torch_us:.2f} us, gemma(ours) {avg_gemma_us:.2f} us {gemma_tflops:.2f} TFLOPS (vs torch {speedup_gemma:.2f}x)"
+        f"torch {avg_torch_us:.2f} us, gemma(ours) {avg_gemma_us:.2f} us {gemma_tflops:.2f} TFLOPS"
     )
     if AITER_AVAILABLE:
         i = 0
@@ -376,7 +376,7 @@ def run_perf_fused_add_rmsnorm(dtype, m, n, num_iters=10):
         avg_aiter_us = sum(latencies_aiter) / num_iters
         speedup_aiter = avg_torch_us / avg_aiter_us if avg_aiter_us > 0 else 0.0
         gemma_vs_aiter = avg_aiter_us / avg_gemma_us if avg_gemma_us > 0 else 0.0
-        line += f", aiter {avg_aiter_us:.2f} us (vs torch {speedup_aiter:.2f}x), gemma/aiter {gemma_vs_aiter:.2f}x"
+        line += f", aiter {avg_aiter_us:.2f} us, gemma/aiter {gemma_vs_aiter:.2f}x"
     print(line)
 
 
