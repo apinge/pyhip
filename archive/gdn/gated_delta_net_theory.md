@@ -120,7 +120,7 @@ $$
 
 $$
 \begin{equation}
-||k_t||=1
+\Vert k_t \Vert = 1
 \end{equation}
 $$
 
@@ -617,7 +617,7 @@ $$
 
 这已经和最终公式$`\mathbf{S}_{[t+1]} = \overrightarrow{\mathbf{S}_{[t]} } + \left( \widetilde{\mathbf{U}_{[t]} } - \overleftarrow{\mathbf{W}_{[t]} } \mathbf{S}_{[t]}^\top \right)^\top \overrightarrow{\mathbf{K}_{[t]} } `$ 非常接近。就差$`\Delta V_{[t]}`$继续推导。
 
-之前的31式子
+之前的式子
 
 $$
 \begin{equation}
@@ -652,7 +652,7 @@ S_{i-1} = \gamma^{i-1} S_{[t]} + \sum_{j < i} \frac{\gamma^{i-1}}{\gamma^j} \Del
 \end{equation}
 $$
 
-代入$`S_{t-1}k_t`$到45式：
+代入$`S_{t-1}k_t`$：
 
 所以
 
@@ -676,20 +676,56 @@ $$
 {\Delta}V\in\mathbb{R}^{C\times{d_v}}
 $$
 
-把之前的48式写成矩阵
-
-$$
+把之前的
+$`
 \begin{equation}
-(1+L){\Delta}V=\beta{V}
+\Delta v_i
+=\beta_i
+\left(
+v_i-
+\gamma^{i-1}S_{[t]}k_i-
+\sum_{j<i}{\frac{\gamma^{i-1}}{\gamma^j}}(k_j^\top k_i){\Delta v_j}
+\right)
 \end{equation}
-$$
+`$
+式写成矩阵
+
+```math
+\Delta v_i + \beta_i \sum_{j < i} \frac{\gamma^{i-1}}{\gamma^j} (k_j^\top k_i) \Delta v_j = \beta_i v_i - \beta_i \gamma^{i-1} S_{[t]} k_i
+```
+
+由于求和项$` \beta_i \sum_{j < i} \frac{\gamma^{i-1}}{\gamma^j}  (k_j^\top k_i) `$只在$`j<i `$存在
+
+```math
+\mathbf{L}_{ij} = 
+\begin{cases}
+\beta_i \frac{\gamma^{i-1} }{\gamma_{j}}  (k_j^\top k_i) , & j < i \\
+0, & j >= i
+\end{cases}
+```
+
+```math
+L = \text{strictLower} (\text{diag}(B) (\Gamma \odot K K^\top) )
+```
+
+所以
+
+```math
+(1+L){\Delta}V=\beta{V}-BS^\top_{[t]}
+```
 
 其中
 
-$$
-\begin{equation}
-L=\text{strictLower}(\text{diag}(\beta)(\Gamma\odot KK^\top))\end{equation}
-$$
+```math
+L=\text{strictLower}(\text{diag}(\beta)(\Gamma\odot KK^\top))
+```
+
+且
+```math
+B_i = \beta_i \gamma^{i-1} k_i
+```
+
+我们定义
 
 $$
 \begin{equation}
@@ -712,7 +748,7 @@ I+
 \end{equation}
 $$
 
-现在再加48式子的$`-\gamma^{i-1}S_{[t]}k_i`$
+现在再加$`\Delta {v}`$式子的$`-\gamma^{i-1}S_{[t]}k_i`$
 
 $$
 \begin{equation}
@@ -720,7 +756,7 @@ WS^T_{[t]}
 \end{equation}
 $$
 
-其中
+其中论文的表达如下
 
 $$
 \begin{equation}
@@ -733,6 +769,8 @@ I+
 \text{diag}(\beta)K
 \end{equation}
 $$
+
+这里严格的推导是$` W = (1+L)^{-1} \text{diag}(\beta \gamma^{i-1}) K`$ 上面论文的表达似乎是 rescaling 得到的。
 
 最终的memory更新
 
