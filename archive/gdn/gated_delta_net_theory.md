@@ -433,6 +433,121 @@ $$W_{[t]} = [I + \text{strictLower}(diag(\beta) K K^\top)]^{-1} diag(\beta) K$$
 
 * 于是 $`\overleftarrow{\mathbf{W}_{[t]}} \mathbf{S}_{[t]}^\top`$ 就是“历史 memory 对当前增量的投影”
 
+### ChunkWise GDN的torch实现
+
+```python
+def chunk_gated_delta_rule_ref_nvlab(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    g: torch.Tensor,
+    chunk_size: int = 64,
+    initial_state: torch.Tensor = None,
+):
+    """
+    Pure PyTorch chunk reference from NVlabs GatedDeltaNet (same math as their chunk.py).
+    Inputs: (B, T, H, D) in FLA convention. g in log space. Returns o (B, T, H, V).
+    https://github.com/NVlabs/GatedDeltaNet/blob/main/lit_gpt/gated_delta_rule_ops/chunk.py
+    """
+    BT = chunk_size
+    # BT(chunk_size)=64
+    q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
+    # after transpose (B,H,T,D):
+    # q.shape=torch.Size([1, 8, 8000, 128]), 
+    # k.shape=torch.Size([1, 8, 8000, 128]), 
+    # v.shape=torch.Size([1, 8, 8000, 128]), 
+    # beta.shape=torch.Size([1, 8, 8000])
+    # g.shape=torch.Size([1, 8, 8000])
+    T_orig = q.shape[-2] #  T_orig=8000,
+    pad_len = (BT - (T_orig % BT)) % BT # pad_len =0
+    if pad_len > 0:
+        q = F.pad(q, (0, 0, 0, pad_len))
+        k = F.pad(k, (0, 0, 0, pad_len))
+        v = F.pad(v, (0, 0, 0, pad_len))
+        beta = F.pad(beta, (0, pad_len))
+        g = F.pad(g, (0, pad_len))
+        print(f"[chunk_gated_delta_rule_ref_nvlab] after pad: q.shape={q.shape}")
+
+    q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
+    decay = g
+    b, h, l, d_k = q.shape
+    d_v = v.shape[-1]
+    # b=1, h=8, l=8000, d_k=128, d_v=128, l//BT=125
+    q = q * (d_k ** -0.5)
+    v = v * beta[..., None]
+    k_beta = k * beta[..., None]
+    assert l % BT == 0, f"seq length {l} must be multiple of chunk_size {BT}"
+
+    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
+    """
+    mask.shape=(64, 64)
+    torch.triu是创建上三角
+    如果BT = 4
+    [[ True,  True,  True,  True],  # 这一行代表时刻 0
+    [False,  True,  True,  True],  # 这一行代表时刻 1
+    [False, False,  True,  True],  # 这一行代表时刻 2
+    [False, False, False,  True]]  # 这一行代表时刻 3
+    这个矩阵后续 在mask_fill那个地方 做Strictly Lower Triangular
+    """
+    q, k, v, k_beta, decay = map(
+        lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BT),
+        [q, k, v, k_beta, decay.unsqueeze(-1)],
+    )
+    decay = decay.squeeze(-1).cumsum(-1)
+    # after rearrange(c=BT=64): q.shape=torch.Size([1, 8, 125, 64, 128]), decay.shape=torch.Size([1, 8, 125, 64])
+    # .cumsum(-1)是在对decay最后一个维度做前缀和
+    """
+    此时 decay 的形状是 [1, 8, 125, 64]。
+    decay.unsqueeze(-1): 形状变为 [1, 8, 125, 64, 1]（变成列向量视图）。
+    decay.unsqueeze(-2): 形状变为 [1, 8, 125, 1, 64]（变成行向量视图）。相减 (-): 触发广播机制。PyTorch 会创建一个 64x64 的矩阵，其中位置 (i, j) 的值正好是 decay[i] - decay[j]。.exp(): 得到最终的衰减矩阵。结果：L_mask[i, j] 存储的就是从时刻 $j$ 到时刻 $i$ 的累积衰减系数。
+    """
+    L_mask = (decay.unsqueeze(-1) - decay.unsqueeze(-2)).exp()
+    # L_mask.shape=torch.Size([1, 8, 125, 64, 64])
+    # 上三角包括对角线 全部填充为0
+    attn = -((k_beta @ k.transpose(-1, -2)) * L_mask).masked_fill(mask, 0)
+    for i in range(1, BT):
+        attn[..., i, :i] = attn[..., i, :i].clone() + (attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()).sum(-2)
+    attn = attn + torch.eye(BT, dtype=torch.float, device=q.device)
+    # attn.shape=torch.Size([1, 8, 125, 64, 64]) (last two dims are 64,64)
+    k_cumsum = attn @ v
+    attn = -((k_beta @ k.transpose(-1, -2))).masked_fill(mask, 0)
+    for i in range(1, BT):
+        attn[..., i, :i] = attn[..., i, :i].clone() + (attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()).sum(-2)
+    attn = attn + torch.eye(BT, dtype=torch.float, device=q.device)
+    k_cumdecay = attn @ k_beta
+    u = v = k_cumsum # 这个u后面没用到不管 把v更新了
+    # k_cumsum/k_cumdecay shape: torch.Size([1, 8, 125, 64, 128]), v.shape=torch.Size([1, 8, 125, 64, 128])
+
+    S = k.new_zeros(b, h, d_k, d_v)
+    if initial_state is not None:
+        S = initial_state.to(torch.float32)
+        # initial_state set: S.shape=torch.Size([1, 8, 128, 128])
+    else:
+        print(f"[chunk_gated_delta_rule_ref_nvlab] S.shape={S.shape} (zeros)")
+    o = torch.zeros_like(v)
+    mask_o = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
+    num_chunks = l // BT
+    # mum_chunks=l//BT=125, mask_o.shape=(64,64)
+    for i in range(0, num_chunks):
+        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
+        attn_i = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask_o, 0)
+        v_prime = (k_cumdecay[:, :, i] * decay[:, :, i, :, None].exp()) @ S
+        v_new = v_i - v_prime
+        o_inter = (q_i * decay[:, :, i, :, None].exp()) @ S
+        o[:, :, i] = o_inter + attn_i @ v_new
+        S = S * decay[:, :, i, -1, None, None].exp() + (k_i * (decay[:, :, i, -1, None] - decay[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+        # if i == 0 or i == num_chunks - 1:
+        #     print(f"[chunk_gated_delta_rule_ref_nvlab] chunk i={i}: q_i.shape={q_i.shape}, attn_i.shape={attn_i.shape}, v_new.shape={v_new.shape}, S.shape={S.shape}")
+            #  chunk i=0: q_i.shape=torch.Size([1, 8, 64, 128]), attn_i.shape=torch.Size([1, 8, 64, 64]), v_new.shape=torch.Size([1, 8, 64, 128]), S.shape=torch.Size([1, 8, 128, 128])
+
+    o = rearrange(o, 'b h n c d -> b h (n c) d')
+    o = o[:, :, :T_orig]
+    o = o.transpose(1, 2).contiguous()
+    # return o.shape=torch.Size([1, 8000, 8, 128])
+    return o
+```
+
 ### 附加： chunk wise形式推导
 我们从**memory 更新**和**attention**输出两个式子出发：
 
@@ -902,120 +1017,6 @@ O_{[t]}=
 \end{equation}
 $$
 
-### ChunkWise GDN的torch实现
-
-```python
-def chunk_gated_delta_rule_ref_nvlab(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    beta: torch.Tensor,
-    g: torch.Tensor,
-    chunk_size: int = 64,
-    initial_state: torch.Tensor = None,
-):
-    """
-    Pure PyTorch chunk reference from NVlabs GatedDeltaNet (same math as their chunk.py).
-    Inputs: (B, T, H, D) in FLA convention. g in log space. Returns o (B, T, H, V).
-    https://github.com/NVlabs/GatedDeltaNet/blob/main/lit_gpt/gated_delta_rule_ops/chunk.py
-    """
-    BT = chunk_size
-    # BT(chunk_size)=64
-    q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
-    # after transpose (B,H,T,D):
-    # q.shape=torch.Size([1, 8, 8000, 128]), 
-    # k.shape=torch.Size([1, 8, 8000, 128]), 
-    # v.shape=torch.Size([1, 8, 8000, 128]), 
-    # beta.shape=torch.Size([1, 8, 8000])
-    # g.shape=torch.Size([1, 8, 8000])
-    T_orig = q.shape[-2] #  T_orig=8000,
-    pad_len = (BT - (T_orig % BT)) % BT # pad_len =0
-    if pad_len > 0:
-        q = F.pad(q, (0, 0, 0, pad_len))
-        k = F.pad(k, (0, 0, 0, pad_len))
-        v = F.pad(v, (0, 0, 0, pad_len))
-        beta = F.pad(beta, (0, pad_len))
-        g = F.pad(g, (0, pad_len))
-        print(f"[chunk_gated_delta_rule_ref_nvlab] after pad: q.shape={q.shape}")
-
-    q, k, v, beta, g = map(lambda x: x.to(torch.float32), [q, k, v, beta, g])
-    decay = g
-    b, h, l, d_k = q.shape
-    d_v = v.shape[-1]
-    # b=1, h=8, l=8000, d_k=128, d_v=128, l//BT=125
-    q = q * (d_k ** -0.5)
-    v = v * beta[..., None]
-    k_beta = k * beta[..., None]
-    assert l % BT == 0, f"seq length {l} must be multiple of chunk_size {BT}"
-
-    mask = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=0)
-    """
-    mask.shape=(64, 64)
-    torch.triu是创建上三角
-    如果BT = 4
-    [[ True,  True,  True,  True],  # 这一行代表时刻 0
-    [False,  True,  True,  True],  # 这一行代表时刻 1
-    [False, False,  True,  True],  # 这一行代表时刻 2
-    [False, False, False,  True]]  # 这一行代表时刻 3
-    这个矩阵后续 在mask_fill那个地方 做Strictly Lower Triangular
-    """
-    q, k, v, k_beta, decay = map(
-        lambda x: rearrange(x, 'b h (n c) d -> b h n c d', c=BT),
-        [q, k, v, k_beta, decay.unsqueeze(-1)],
-    )
-    decay = decay.squeeze(-1).cumsum(-1)
-    # after rearrange(c=BT=64): q.shape=torch.Size([1, 8, 125, 64, 128]), decay.shape=torch.Size([1, 8, 125, 64])
-    # .cumsum(-1)是在对decay最后一个维度做前缀和
-    """
-    此时 decay 的形状是 [1, 8, 125, 64]。
-    decay.unsqueeze(-1): 形状变为 [1, 8, 125, 64, 1]（变成列向量视图）。
-    decay.unsqueeze(-2): 形状变为 [1, 8, 125, 1, 64]（变成行向量视图）。相减 (-): 触发广播机制。PyTorch 会创建一个 64x64 的矩阵，其中位置 (i, j) 的值正好是 decay[i] - decay[j]。.exp(): 得到最终的衰减矩阵。结果：L_mask[i, j] 存储的就是从时刻 $j$ 到时刻 $i$ 的累积衰减系数。
-    """
-    L_mask = (decay.unsqueeze(-1) - decay.unsqueeze(-2)).exp()
-    # L_mask.shape=torch.Size([1, 8, 125, 64, 64])
-    # 上三角包括对角线 全部填充为0
-    attn = -((k_beta @ k.transpose(-1, -2)) * L_mask).masked_fill(mask, 0)
-    for i in range(1, BT):
-        attn[..., i, :i] = attn[..., i, :i].clone() + (attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()).sum(-2)
-    attn = attn + torch.eye(BT, dtype=torch.float, device=q.device)
-    # attn.shape=torch.Size([1, 8, 125, 64, 64]) (last two dims are 64,64)
-    k_cumsum = attn @ v
-    attn = -((k_beta @ k.transpose(-1, -2))).masked_fill(mask, 0)
-    for i in range(1, BT):
-        attn[..., i, :i] = attn[..., i, :i].clone() + (attn[..., i, :i, None].clone() * attn[..., :i, :i].clone()).sum(-2)
-    attn = attn + torch.eye(BT, dtype=torch.float, device=q.device)
-    k_cumdecay = attn @ k_beta
-    u = v = k_cumsum # 这个u后面没用到不管 把v更新了
-    # k_cumsum/k_cumdecay shape: torch.Size([1, 8, 125, 64, 128]), v.shape=torch.Size([1, 8, 125, 64, 128])
-
-    S = k.new_zeros(b, h, d_k, d_v)
-    if initial_state is not None:
-        S = initial_state.to(torch.float32)
-        # initial_state set: S.shape=torch.Size([1, 8, 128, 128])
-    else:
-        print(f"[chunk_gated_delta_rule_ref_nvlab] S.shape={S.shape} (zeros)")
-    o = torch.zeros_like(v)
-    mask_o = torch.triu(torch.ones(BT, BT, dtype=torch.bool, device=q.device), diagonal=1)
-    num_chunks = l // BT
-    # mum_chunks=l//BT=125, mask_o.shape=(64,64)
-    for i in range(0, num_chunks):
-        q_i, k_i, v_i = q[:, :, i], k[:, :, i], v[:, :, i]
-        attn_i = (q_i @ k_i.transpose(-1, -2) * L_mask[:, :, i]).masked_fill_(mask_o, 0)
-        v_prime = (k_cumdecay[:, :, i] * decay[:, :, i, :, None].exp()) @ S
-        v_new = v_i - v_prime
-        o_inter = (q_i * decay[:, :, i, :, None].exp()) @ S
-        o[:, :, i] = o_inter + attn_i @ v_new
-        S = S * decay[:, :, i, -1, None, None].exp() + (k_i * (decay[:, :, i, -1, None] - decay[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
-        # if i == 0 or i == num_chunks - 1:
-        #     print(f"[chunk_gated_delta_rule_ref_nvlab] chunk i={i}: q_i.shape={q_i.shape}, attn_i.shape={attn_i.shape}, v_new.shape={v_new.shape}, S.shape={S.shape}")
-            #  chunk i=0: q_i.shape=torch.Size([1, 8, 64, 128]), attn_i.shape=torch.Size([1, 8, 64, 64]), v_new.shape=torch.Size([1, 8, 64, 128]), S.shape=torch.Size([1, 8, 128, 128])
-
-    o = rearrange(o, 'b h n c d -> b h (n c) d')
-    o = o[:, :, :T_orig]
-    o = o.transpose(1, 2).contiguous()
-    # return o.shape=torch.Size([1, 8000, 8, 128])
-    return o
-```
 
 # Ref
 
