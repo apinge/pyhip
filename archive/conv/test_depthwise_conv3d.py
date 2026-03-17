@@ -124,13 +124,59 @@ def test_conv3d_benchmark(args):
                         dilation=dilation,
                         groups=groups)
 
-    def run_custom_conv3d():
+    def run_custom_conv3d_reference():
         with torch.no_grad():
             output_tensor = torch.zeros(B, C_out, D_out, H_out, W_out, device=device, dtype=input_dtype)
             num_output = B * C_out * D_out * H_out * W_out
             grid_dim = (num_output + 255) // 256
             kT, kH, kW = kernel_size[0], kernel_size[1], kernel_size[2]
-            hip.conv_depthwise3d_cuda_kernel(
+            hip.conv_depthwise3d_cuda_kernel_reference(
+                [grid_dim], [256],
+                input_tensor.data_ptr(),
+                output_tensor.data_ptr(),
+                weight_tensor.data_ptr(),
+                bias_tensor.data_ptr(),
+                B, C_in, C_out, D, H, W, D_out, H_out, W_out,
+                kT, kH, kW,
+                stride[0], stride[1], stride[2],
+                padding[0], padding[1], padding[2],
+                dilation[0], dilation[1], dilation[2],
+            )
+            return output_tensor
+
+    def run_custom_conv3d_opt1():
+        with torch.no_grad():
+            output_tensor = torch.zeros(B, C_out, D_out, H_out, W_out, device=device, dtype=input_dtype)
+            # Suggestion B (Option 2): block over (b, oc, ot), 256 threads over (oh, ow)
+            plane_size = H_out * W_out
+            num_tiles = (plane_size + 255) // 256
+            grid_dim = B * C_out * D_out * num_tiles
+            kT, kH, kW = kernel_size[0], kernel_size[1], kernel_size[2]
+            hip.conv_depthwise3d_cuda_kernel_opt1(
+                [grid_dim], [256],
+                input_tensor.data_ptr(),
+                output_tensor.data_ptr(),
+                weight_tensor.data_ptr(),
+                bias_tensor.data_ptr(),
+                B, C_in, C_out, D, H, W, D_out, H_out, W_out,
+                kT, kH, kW,
+                stride[0], stride[1], stride[2],
+                padding[0], padding[1], padding[2],
+                dilation[0], dilation[1], dilation[2],
+            )
+            return output_tensor
+
+    def run_custom_conv3d_opt2():
+        with torch.no_grad():
+            output_tensor = torch.zeros(B, C_out, D_out, H_out, W_out, device=device, dtype=input_dtype)
+            # A+B+C: block over (b, oc, ot), 16x16 tile (match cpp TILE_H, TILE_W)
+            TILE_H, TILE_W = 16, 16
+            num_tiles_h = (H_out + TILE_H - 1) // TILE_H
+            num_tiles_w = (W_out + TILE_W - 1) // TILE_W
+            num_tiles = num_tiles_h * num_tiles_w
+            grid_dim = B * C_out * D_out * num_tiles
+            kT, kH, kW = kernel_size[0], kernel_size[1], kernel_size[2]
+            hip.conv_depthwise3d_cuda_kernel_opt2(
                 [grid_dim], [256],
                 input_tensor.data_ptr(),
                 output_tensor.data_ptr(),
@@ -146,19 +192,24 @@ def test_conv3d_benchmark(args):
 
     # 2. 运行 Benchmark
     torch_ms, torch_tflops, torch_warmup_ms = benchmark_op(run_torch_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
-    custom_ms, custom_tflops, custom_warmup_ms = benchmark_op(run_custom_conv3d, f"Custom Conv3d ({args.shape})", args.iters, gflops, device)
+    custom_ref_ms, custom_ref_tflops, custom_ref_warmup_ms = benchmark_op(run_custom_conv3d_reference, f"Custom Conv3d Reference ({args.shape})", args.iters, gflops, device)
+    custom_opt1_ms, custom_opt1_tflops, custom_opt1_warmup_ms = benchmark_op(run_custom_conv3d_opt1, f"Custom Conv3d Opt1 ({args.shape})", args.iters, gflops, device)
+    custom_opt2_ms, custom_opt2_tflops, custom_opt2_warmup_ms = benchmark_op(run_custom_conv3d_opt2, f"Custom Conv3d Opt2 ({args.shape})", args.iters, gflops, device)
 
     # 3. 汇总对比
     print(f"\n--- 性能对比汇总 ({args.shape}) ---")
     print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
     print("-" * 90)
     print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
-    print(f"{'Custom Conv3d':<35} | {custom_ms:>15.4f} | {custom_tflops:>15.2f} | {custom_warmup_ms:>15.2f}")
+    print(f"{'Custom Conv3d Reference':<35} | {custom_ref_ms:>15.4f} | {custom_ref_tflops:>15.2f} | {custom_ref_warmup_ms:>15.2f}")
+    print(f"{'Custom Conv3d Opt1':<35} | {custom_opt1_ms:>15.4f} | {custom_opt1_tflops:>15.2f} | {custom_opt1_warmup_ms:>15.2f}")
+    print(f"{'Custom Conv3d Opt2':<35} | {custom_opt2_ms:>15.4f} | {custom_opt2_tflops:>15.2f} | {custom_opt2_warmup_ms:>15.2f}")
 
     print(f"Run Accuracy check for {args.shape}...")
     ref = run_torch_conv3d()
     print(ref.shape, ref.dtype)
-    ret = run_custom_conv3d()
+    # ret = run_custom_conv3d_opt1()
+    ret = run_custom_conv3d_opt2()
     print(ret.shape, ret.dtype)
     all_diff = pyhip.calc_diff(ref, ret)
     if all_diff > 0.001:
