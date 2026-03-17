@@ -26,6 +26,8 @@ To maintain broader portability, I've tried to write the code in a more general 
 
 - [ThunderKittens](https://github.com/HazyResearch/ThunderKittens)
 
+- [TransformerEngine](https://github.com/NVIDIA/TransformerEngine/tree/main)
+
 ## Other Reference
 
 
