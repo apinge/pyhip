@@ -319,6 +319,133 @@ __global__ void conv_depthwise3d_cuda_kernel_opt2(
          + out_frame * output_stride_t + oh * oW + ow] = (__fp16)sum;
 }
 
+// opt3 specialized for case3 (shape3): B=1, C=512, D=61, H=45, W=80, kernel (3,5,5), pad (0,2,2), stride/dilation 1.
+// D_out=59, oH=45, oW=80; in_tile_h=49, in_tile_w=84. No runtime shape checks.
+constexpr int S3_KT = 3;
+constexpr int S3_KH = 5;
+constexpr int S3_KW = 5;
+constexpr int S3_OH = 45;
+constexpr int S3_OW = 80;
+constexpr int S3_IN_TILE_H = (S3_OH - 1) * 1 + (S3_KH - 1) * 1 + 1;  // 49
+constexpr int S3_IN_TILE_W = (S3_OW - 1) * 1 + (S3_KW - 1) * 1 + 1;  // 84
+constexpr int S3_WEIGHT_SIZE = S3_KT * S3_KH * S3_KW;                 // 75
+constexpr int S3_INPUT_PATCH_SIZE = S3_KT * S3_IN_TILE_H * S3_IN_TILE_W;
+
+__global__ void conv_depthwise3d_cuda_kernel_opt3(
+    const void* __restrict__ input_void,
+    void* __restrict__ output_void,
+    const void* __restrict__ kernel_void,
+    const void* __restrict__ bias_void,
+    int batch,
+    int iC,
+    int oC,
+    int iT,
+    int iH,
+    int iW,
+    int oT,
+    int oH,
+    int oW,
+    int kT,
+    int kH,
+    int kW,
+    int strideT,
+    int strideH,
+    int strideW,
+    int paddingT,
+    int paddingH,
+    int paddingW,
+    int dilationT,
+    int dilationH,
+    int dilationW)
+{
+  const __fp16* input = static_cast<const __fp16*>(input_void);
+  __fp16* output = static_cast<__fp16*>(output_void);
+  const __fp16* kernel = static_cast<const __fp16*>(kernel_void);
+  const __fp16* bias = static_cast<const __fp16*>(bias_void);
+
+  __shared__ __fp16 s_weight[S3_WEIGHT_SIZE];
+  __shared__ __fp16 s_input[S3_INPUT_PATCH_SIZE];
+
+  const int input_stride_c = iT * iH * iW;
+  const int input_stride_t = iH * iW;
+  const int output_stride_c = oT * S3_OH * S3_OW;
+  const int output_stride_t = S3_OH * S3_OW;
+
+  const int slice_idx = blockIdx.x;
+  const int b = slice_idx / (oC * oT);
+  const int rest = slice_idx % (oC * oT);
+  const int out_channel = rest / oT;
+  const int out_frame = rest % oT;
+
+  const int in_frame_start = out_frame * strideT - paddingT;
+  const int in_row_start = -paddingH;
+  const int in_col_start = -paddingW;
+
+  for (int base = threadIdx.x * 4; base < S3_WEIGHT_SIZE; base += blockDim.x * 4) {
+    if (base + 4 <= S3_WEIGHT_SIZE) {
+      const float16x4 v = *reinterpret_cast<const float16x4*>(kernel + out_channel * S3_WEIGHT_SIZE + base);
+      *reinterpret_cast<float16x4*>(&s_weight[base]) = v;
+    } else {
+      for (int i = 0; i < 4 && (base + i) < S3_WEIGHT_SIZE; ++i)
+        s_weight[base + i] = kernel[out_channel * S3_WEIGHT_SIZE + base + i];
+    }
+  }
+  __syncthreads();
+
+  const __fp16* input_base = input + b * iC * input_stride_c + out_channel * input_stride_c;
+  for (int base = threadIdx.x * 4; base < S3_INPUT_PATCH_SIZE; base += blockDim.x * 4) {
+    const int kf = base / (S3_IN_TILE_H * S3_IN_TILE_W);
+    const int hr = (base / S3_IN_TILE_W) % S3_IN_TILE_H;
+    const int wc = base % S3_IN_TILE_W;
+    const int in_f = in_frame_start + kf * dilationT;
+    const int in_r = in_row_start + hr;
+    const int in_c = in_col_start + wc;
+    const bool can_vec = (wc + 4 <= S3_IN_TILE_W) &&
+                         (in_f >= 0 && in_f < iT && in_r >= 0 && in_r < iH && in_c >= 0 && in_c + 4 <= iW);
+    if (can_vec) {
+      const size_t gaddr = (size_t)in_f * input_stride_t + (size_t)in_r * iW + in_c;
+      const float16x4 v = *reinterpret_cast<const float16x4*>(input_base + gaddr);
+      *reinterpret_cast<float16x4*>(&s_input[base]) = v;
+    } else {
+      for (int i = 0; i < 4 && (base + i) < S3_INPUT_PATCH_SIZE; ++i) {
+        const int idx = base + i;
+        const int kfi = idx / (S3_IN_TILE_H * S3_IN_TILE_W);
+        const int hri = (idx / S3_IN_TILE_W) % S3_IN_TILE_H;
+        const int wci = idx % S3_IN_TILE_W;
+        const int in_fi = in_frame_start + kfi * dilationT;
+        const int in_ri = in_row_start + hri;
+        const int in_ci = in_col_start + wci;
+        float val = 0.0f;
+        if (in_fi >= 0 && in_fi < iT && in_ri >= 0 && in_ri < iH && in_ci >= 0 && in_ci < iW)
+          val = (float)input_base[in_fi * input_stride_t + in_ri * iW + in_ci];
+        s_input[idx] = (__fp16)val;
+      }
+    }
+  }
+  __syncthreads();
+
+  const int num_outputs = S3_OH * S3_OW;
+  for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
+    const int oh = out_linear / S3_OW;
+    const int ow = out_linear % S3_OW;
+    float sum = 0.0f;
+    int wi = 0;
+    for (int kf = 0; kf < S3_KT; ++kf) {
+      for (int kr = 0; kr < S3_KH; ++kr) {
+        for (int kc = 0; kc < S3_KW; ++kc, ++wi) {
+          const int hr = oh * strideH + kr * dilationH;
+          const int wc = ow * strideW + kc * dilationW;
+          const int in_idx = kf * (S3_IN_TILE_H * S3_IN_TILE_W) + hr * S3_IN_TILE_W + wc;
+          sum += (float)s_weight[wi] * (float)s_input[in_idx];
+        }
+      }
+    }
+    if (bias != nullptr) sum += (float)bias[out_channel];
+    output[b * oC * output_stride_c + out_channel * output_stride_c
+           + out_frame * output_stride_t + oh * S3_OW + ow] = (__fp16)sum;
+  }
+}
+
 __global__ void conv_depthwise3d_cuda_kernel_reference(
     const void* input_void,
     void* output_void,
