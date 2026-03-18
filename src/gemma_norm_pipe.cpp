@@ -176,7 +176,7 @@ __global__ void  gemma_fused_add_rmsnorm_fp16(
     vec8_t<__fp16> * smem_vec = reinterpret_cast<vec8_t<__fp16>*>(smem);
     const uint32_t tx = threadIdx.x;
     const uint32_t ty = threadIdx.y;
-    const uint32_t row_offset = blockIdx.x*row_tile*vec_hidden_size;
+    const uint32_t row_offset = (4096>>3)*blockIdx.x; //blockIdx.x*row_tile*vec_hidden_size;
     const uint32_t rounds = hidden_size>>9;//除以64个thread X 8 vec
     const uint32_t vec_per_thread = (WARP_SIZE>>3); // 8, 每线程负责 8 个 vec
 
@@ -184,24 +184,24 @@ __global__ void  gemma_fused_add_rmsnorm_fp16(
     vec8_t<__fp16> one = {1, 1, 1, 1, 1, 1, 1, 1};
 
     // 每线程从自己负责的段起始加载，而非都从 row_offset 加载
-    const uint32_t thread_start = row_offset + vec_per_thread * tx;
+    const uint32_t thread_start = row_offset +  tx;
     vec8_t<__fp16> curr_vec = vectorized_in[thread_start];
     vec8_t<__fp16> curr_residule = vectorized_residule[thread_start];
 
     //vec8_t<__fp16> curr_weight = vectorized_weight[0];
     for(uint32_t i = 1; i < rounds; i++){
-        // load next
-        int32_t local_idx = vec_per_thread *tx +i;
-        int32_t vec_idx = local_idx+ row_offset;
+        // load next: 第 i 段对应全局 [row_offset + i*64, row_offset + i*64+63]
+        int32_t local_idx = i * 64 + tx;
+        int32_t vec_idx = row_offset + i * 64 + tx;  // 原 thread_start+i 错误：i=1 时 thread0 会读到 row_offset+1 而非 row_offset+64
         vec8_t<__fp16> next_vec = vectorized_in[vec_idx];
         vec8_t<__fp16> next_residule = vectorized_residule[vec_idx];
         
         curr_vec += curr_residule;
        
         // store residule
-        //vectorized_residule[row_offset+i] = curr_vec;
-        *(float32x4*)&(vectorized_residule[vec_idx-1])= *(float32x4*)&curr_vec;
-        smem_vec[local_idx-1] = curr_vec;
+
+        *(float32x4*)&(vectorized_residule[vec_idx-64])= *(float32x4*)&curr_vec;
+        smem_vec[local_idx-64] = curr_vec;
         v8_variance += curr_vec * curr_vec;
 
         curr_vec = next_vec;
@@ -209,11 +209,11 @@ __global__ void  gemma_fused_add_rmsnorm_fp16(
      
     }
     curr_vec += curr_residule;
-    int32_t local_idx =  vec_per_thread *tx +rounds-1;
+    int32_t local_idx =  (rounds-1) * 64 + tx;//vec_per_thread *tx +rounds-1;
     int32_t vec_idx = local_idx+ row_offset;
-   // vectorized_residule[row_offset+rounds-1] = curr_vec;
-    *(float32x4*)&vectorized_residule[vec_idx] = *(float32x4*)&curr_vec;
-        smem_vec[local_idx] = curr_vec;
+  
+     *(float32x4*)&vectorized_residule[vec_idx] = *(float32x4*)&curr_vec;
+      smem_vec[local_idx] = curr_vec;
     v8_variance += curr_vec * curr_vec;
     float sum_sq = v8_variance.sum();
 
@@ -235,7 +235,7 @@ __global__ void  gemma_fused_add_rmsnorm_fp16(
     // }
     // 与 torch 一致：在 float 下做 normalized * (1+weight)，再一次性转 fp16，避免两次舍入导致 weight!=0 时精度差
     for(uint32_t i = 0; i < rounds; i++){
-        int32_t row_local = tx *  vec_per_thread  + i;
+        int32_t row_local =i * 64 + tx;// tx *  vec_per_thread  + i;
         int32_t vec_idx = row_local + row_offset;
         vec8_t<__fp16> tmp = smem_vec[row_local];
         vec8_t<__fp16> v8_w = vectorized_weight[row_local];
