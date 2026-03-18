@@ -326,8 +326,8 @@ constexpr int S3_KH = 5;
 constexpr int S3_KW = 5;
 constexpr int S3_OH = 45;
 constexpr int S3_OW = 80;
-constexpr int S3_IN_TILE_H = (S3_OH - 1) * 1 + (S3_KH - 1) * 1 + 1;  // 49
-constexpr int S3_IN_TILE_W = (S3_OW - 1) * 1 + (S3_KW - 1) * 1 + 1;  // 84
+constexpr int S3_IN_TILE_H = (S3_OH - 1) * 1 + (S3_KH - 1) * 1 + 1;   // 49
+constexpr int S3_IN_TILE_W = (S3_OW - 1) * 1 + (S3_KW - 1) * 1 + 1;   // 84
 constexpr int S3_WEIGHT_SIZE = S3_KT * S3_KH * S3_KW;                 // 75
 constexpr int S3_INPUT_PATCH_SIZE = S3_KT * S3_IN_TILE_H * S3_IN_TILE_W;
 
@@ -431,24 +431,37 @@ __global__ void conv_depthwise3d_cuda_kernel_opt3(
   }
 
   const int num_outputs = S3_OH * S3_OW;
-  // key performance optimization: unroll the loop
+  // key performance optimization: unroll the loop 15ms -> 10ms
   #pragma unroll 2
   for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
     const int oh = out_linear / S3_OW;
     const int ow = out_linear % S3_OW;
     float sum = 0.0f;
-    int wi = 0;
 
+    // Preload S3_KT*S3_KH*S3_KW input taps for this (oh,ow) from LDS -> registers (wi order). 10ms -> 9.28 ms
+    float input_reg[S3_WEIGHT_SIZE];
+    {
+      int wi_load = 0;
+      for (int kf = 0; kf < S3_KT; ++kf) {
+        for (int kr = 0; kr < S3_KH; ++kr) {
+          for (int kc = 0; kc < S3_KW; ++kc, ++wi_load) {
+            const int hr = oh * strideH + kr * dilationH;
+            const int wc = ow * strideW + kc * dilationW;
+            const int in_idx = kf * (S3_IN_TILE_H * S3_IN_TILE_W) + hr * S3_IN_TILE_W + wc;
+            input_reg[wi_load] = (float)s_input[in_idx];
+          }
+        }
+      }
+    }
+
+    int wi = 0;
     //#pragma unroll
     for (int kf = 0; kf < S3_KT; ++kf) {
       //#pragma unroll
       for (int kr = 0; kr < S3_KH; ++kr) {
         //#pragma unroll
         for (int kc = 0; kc < S3_KW; ++kc, ++wi) {
-          const int hr = oh * strideH + kr * dilationH;
-          const int wc = ow * strideW + kc * dilationW;
-          const int in_idx = kf * (S3_IN_TILE_H * S3_IN_TILE_W) + hr * S3_IN_TILE_W + wc;
-          sum += weight_reg[wi] * (float)s_input[in_idx];
+          sum += weight_reg[wi] * input_reg[wi];
         }
       }
     }
