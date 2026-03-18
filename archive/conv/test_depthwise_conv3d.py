@@ -1,5 +1,5 @@
 import pyhip
-hip = pyhip.module("depthwise_conv3d.cpp")
+hip = pyhip.module("depthwise_conv3d.cpp", "-g -O3")
 
 import torch
 import torch.nn as nn
@@ -67,6 +67,12 @@ def test_conv3d_benchmark(args):
         kernel_size = (3, 5, 5)
         padding = (0, 2, 2)
         groups = 512
+    elif args.shape == "case3_32x32":
+        # Case 3: [1, 32, 61, 45, 80] x [32, 1, 3, 5, 5], groups=32
+        B, C_in, C_out, D, H, W = 1, 32, 32, 61, 45, 80
+        kernel_size = (3, 5, 5)
+        padding = (0, 2, 2)
+        groups = 32
     elif args.shape == "case4":
         # Case 4: [1, 2048, 61, 45, 80] x [2048, 512, 1, 1, 1], groups=4
         B, C_in, C_out, D, H, W = 1, 2048, 2048, 61, 45, 80
@@ -213,8 +219,8 @@ def test_conv3d_benchmark(args):
     # 2. 运行 Benchmark
     torch_ms, torch_tflops, torch_warmup_ms = benchmark_op(run_torch_conv3d, f"Standard PyTorch Conv3d ({args.shape})", args.iters, gflops, device)
     custom_ref_ms, custom_ref_tflops, custom_ref_warmup_ms = benchmark_op(run_custom_conv3d_reference, f"Custom Conv3d Reference ({args.shape})", args.iters, gflops, device)
-    custom_opt1_ms, custom_opt1_tflops, custom_opt1_warmup_ms = benchmark_op(run_custom_conv3d_opt1, f"Custom Conv3d Opt1 ({args.shape})", args.iters, gflops, device)
-    custom_opt2_ms, custom_opt2_tflops, custom_opt2_warmup_ms = benchmark_op(run_custom_conv3d_opt2, f"Custom Conv3d Opt2 ({args.shape})", args.iters, gflops, device)
+    # custom_opt1_ms, custom_opt1_tflops, custom_opt1_warmup_ms = benchmark_op(run_custom_conv3d_opt1, f"Custom Conv3d Opt1 ({args.shape})", args.iters, gflops, device)
+    # custom_opt2_ms, custom_opt2_tflops, custom_opt2_warmup_ms = benchmark_op(run_custom_conv3d_opt2, f"Custom Conv3d Opt2 ({args.shape})", args.iters, gflops, device)
     custom_opt3_ms, custom_opt3_tflops, custom_opt3_warmup_ms = benchmark_op(run_custom_conv3d_opt3, f"Custom Conv3d Opt3 ({args.shape})", args.iters, gflops, device)
 
     # 3. 汇总对比
@@ -223,8 +229,8 @@ def test_conv3d_benchmark(args):
     print("-" * 90)
     print(f"{'Standard PyTorch Conv3d':<35} | {torch_ms:>15.4f} | {torch_tflops:>15.2f} | {torch_warmup_ms:>15.2f}")
     print(f"{'Custom Conv3d Reference':<35} | {custom_ref_ms:>15.4f} | {custom_ref_tflops:>15.2f} | {custom_ref_warmup_ms:>15.2f}")
-    print(f"{'Custom Conv3d Opt1':<35} | {custom_opt1_ms:>15.4f} | {custom_opt1_tflops:>15.2f} | {custom_opt1_warmup_ms:>15.2f}")
-    print(f"{'Custom Conv3d Opt2':<35} | {custom_opt2_ms:>15.4f} | {custom_opt2_tflops:>15.2f} | {custom_opt2_warmup_ms:>15.2f}")
+    # print(f"{'Custom Conv3d Opt1':<35} | {custom_opt1_ms:>15.4f} | {custom_opt1_tflops:>15.2f} | {custom_opt1_warmup_ms:>15.2f}")
+    # print(f"{'Custom Conv3d Opt2':<35} | {custom_opt2_ms:>15.4f} | {custom_opt2_tflops:>15.2f} | {custom_opt2_warmup_ms:>15.2f}")
     print(f"{'Custom Conv3d Opt3':<35} | {custom_opt3_ms:>15.4f} | {custom_opt3_tflops:>15.2f} | {custom_opt3_warmup_ms:>15.2f}")
 
     print(f"Run Accuracy check for {args.shape}...")
@@ -275,8 +281,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Conv3d Benchmark 脚本")
     parser.add_argument("--iters", type=int, default=10, help="迭代次数")
     parser.add_argument("--profile", action="store_true", help="是否启用 profile")
-    parser.add_argument("--shape", type=str, default="case3", choices=["case1", "case2", "case3", "case4"], 
-                        help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case4 ([1, 2048, 61, 45, 80], groups=4)")
+    parser.add_argument("--shape", type=str, default="case3", choices=["case1", "case2", "case3", "case3_32x32", "case4"], 
+                        help="选择测试的 shape 选项: case1 ([1, 64, 63, 45, 80]), case2 ([1, 512, 61, 45, 80]), case3 ([1, 512, 61, 45, 80], groups=512), case3_32x32 ([1, 32, 61, 45, 80], groups=32), case4 ([1, 2048, 61, 45, 80], groups=4)")
     args = parser.parse_args()
     
     test_conv3d_benchmark(args)

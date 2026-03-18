@@ -424,19 +424,31 @@ __global__ void conv_depthwise3d_cuda_kernel_opt3(
   }
   __syncthreads();
 
+  // Load filter once per thread from LDS; same weights for all (oh, ow) in this block.
+  float weight_reg[S3_WEIGHT_SIZE];
+  for (int w = 0; w < S3_WEIGHT_SIZE; ++w) {
+    weight_reg[w] = (float)s_weight[w];
+  }
+
   const int num_outputs = S3_OH * S3_OW;
+  // key performance optimization: unroll the loop
+  #pragma unroll 2
   for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
     const int oh = out_linear / S3_OW;
     const int ow = out_linear % S3_OW;
     float sum = 0.0f;
     int wi = 0;
+
+    //#pragma unroll
     for (int kf = 0; kf < S3_KT; ++kf) {
+      //#pragma unroll
       for (int kr = 0; kr < S3_KH; ++kr) {
+        //#pragma unroll
         for (int kc = 0; kc < S3_KW; ++kc, ++wi) {
           const int hr = oh * strideH + kr * dilationH;
           const int wc = ow * strideW + kc * dilationW;
           const int in_idx = kf * (S3_IN_TILE_H * S3_IN_TILE_W) + hr * S3_IN_TILE_W + wc;
-          sum += (float)s_weight[wi] * (float)s_input[in_idx];
+          sum += weight_reg[wi] * (float)s_input[in_idx];
         }
       }
     }
