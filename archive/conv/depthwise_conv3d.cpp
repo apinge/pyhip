@@ -61,6 +61,7 @@
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 
 using float16x4 = __attribute__((__vector_size__(4 * sizeof(__fp16)))) __fp16;
 using float16x8 = __attribute__((__vector_size__(8 * sizeof(__fp16)))) __fp16;
@@ -471,6 +472,122 @@ __global__ void conv_depthwise3d_cuda_kernel_opt3(
   }
 }
 
+// BFloat16 version: input, output, kernel, bias are __hip_bfloat16. Same opt3 shape/schedule.
+__global__ void conv_depthwise3d_cuda_kernel_opt3_bf16(
+    const void* __restrict__ input_void,
+    void* __restrict__ output_void,
+    const void* __restrict__ kernel_void,
+    const void* __restrict__ bias_void,
+    int batch,
+    int iC,
+    int oC,
+    int iT,
+    int iH,
+    int iW,
+    int oT,
+    int oH,
+    int oW,
+    int kT,
+    int kH,
+    int kW,
+    int strideT,
+    int strideH,
+    int strideW,
+    int paddingT,
+    int paddingH,
+    int paddingW,
+    int dilationT,
+    int dilationH,
+    int dilationW)
+{
+  const __hip_bfloat16* input = static_cast<const __hip_bfloat16*>(input_void);
+  __hip_bfloat16* output = static_cast<__hip_bfloat16*>(output_void);
+  const __hip_bfloat16* kernel = static_cast<const __hip_bfloat16*>(kernel_void);
+  const __hip_bfloat16* bias = static_cast<const __hip_bfloat16*>(bias_void);
+
+  __shared__ __hip_bfloat16 s_weight[S3_WEIGHT_SIZE];
+  __shared__ __hip_bfloat16 s_input[S3_INPUT_PATCH_SIZE];
+
+  const int input_stride_c = iT * iH * iW;
+  const int input_stride_t = iH * iW;
+  const int output_stride_c = oT * S3_OH * S3_OW;
+  const int output_stride_t = S3_OH * S3_OW;
+
+  const int slice_idx = blockIdx.x;
+  const int b = slice_idx / (oC * oT);
+  const int rest = slice_idx % (oC * oT);
+  const int out_channel = rest / oT;
+  const int out_frame = rest % oT;
+
+  const int in_frame_start = out_frame * strideT - paddingT;
+  const int in_row_start = -paddingH;
+  const int in_col_start = -paddingW;
+
+  for (int base = threadIdx.x * 4; base < S3_WEIGHT_SIZE; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < S3_WEIGHT_SIZE; ++i)
+      s_weight[base + i] = kernel[out_channel * S3_WEIGHT_SIZE + base + i];
+  }
+  __syncthreads();
+
+  const __hip_bfloat16* input_base = input + b * iC * input_stride_c + out_channel * input_stride_c;
+  for (int base = threadIdx.x * 4; base < S3_INPUT_PATCH_SIZE; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < S3_INPUT_PATCH_SIZE; ++i) {
+      const int idx = base + i;
+      const int kfi = idx / (S3_IN_TILE_H * S3_IN_TILE_W);
+      const int hri = (idx / S3_IN_TILE_W) % S3_IN_TILE_H;
+      const int wci = idx % S3_IN_TILE_W;
+      const int in_fi = in_frame_start + kfi * dilationT;
+      const int in_ri = in_row_start + hri;
+      const int in_ci = in_col_start + wci;
+      float val = 0.0f;
+      if (in_fi >= 0 && in_fi < iT && in_ri >= 0 && in_ri < iH && in_ci >= 0 && in_ci < iW)
+        val = (float)input_base[in_fi * input_stride_t + in_ri * iW + in_ci];
+      s_input[idx] = (__hip_bfloat16)val;
+    }
+  }
+  __syncthreads();
+
+  float weight_reg[S3_WEIGHT_SIZE];
+  for (int w = 0; w < S3_WEIGHT_SIZE; ++w) {
+    weight_reg[w] = (float)s_weight[w];
+  }
+
+  const int num_outputs = S3_OH * S3_OW;
+  #pragma unroll 2
+  for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
+    const int oh = out_linear / S3_OW;
+    const int ow = out_linear % S3_OW;
+    float sum = 0.0f;
+
+    float input_reg[S3_WEIGHT_SIZE];
+    {
+      int wi_load = 0;
+      for (int kf = 0; kf < S3_KT; ++kf) {
+        for (int kr = 0; kr < S3_KH; ++kr) {
+          for (int kc = 0; kc < S3_KW; ++kc, ++wi_load) {
+            const int hr = oh * strideH + kr * dilationH;
+            const int wc = ow * strideW + kc * dilationW;
+            const int in_idx = kf * (S3_IN_TILE_H * S3_IN_TILE_W) + hr * S3_IN_TILE_W + wc;
+            input_reg[wi_load] = (float)s_input[in_idx];
+          }
+        }
+      }
+    }
+
+    int wi = 0;
+    for (int kf = 0; kf < S3_KT; ++kf) {
+      for (int kr = 0; kr < S3_KH; ++kr) {
+        for (int kc = 0; kc < S3_KW; ++kc, ++wi) {
+          sum += weight_reg[wi] * input_reg[wi];
+        }
+      }
+    }
+    if (bias != nullptr) sum += (float)bias[out_channel];
+    output[b * oC * output_stride_c + out_channel * output_stride_c
+           + out_frame * output_stride_t + oh * S3_OW + ow] = (__hip_bfloat16)sum;
+  }
+}
+
 __global__ void conv_depthwise3d_cuda_kernel_reference(
     const void* input_void,
     void* output_void,
@@ -554,5 +671,92 @@ __global__ void conv_depthwise3d_cuda_kernel_reference(
     const int output_stride_t = oH * oW;
     output[b * oC * output_stride_c + out_channel * output_stride_c
            + out_frame * output_stride_t + out_row * oW + out_col] = (__fp16)sum;
+  }
+}
+
+// BFloat16 reference: same logic as conv_depthwise3d_cuda_kernel_reference, bf16 tensors.
+__global__ void conv_depthwise3d_cuda_kernel_reference_bf16(
+    const void* input_void,
+    void* output_void,
+    const void* kernel_void,
+    const void* bias_void,
+    int batch,
+    int iC,
+    int oC,
+    int iT,
+    int iH,
+    int iW,
+    int oT,
+    int oH,
+    int oW,
+    int kT,
+    int kH,
+    int kW,
+    int strideT,
+    int strideH,
+    int strideW,
+    int paddingT,
+    int paddingH,
+    int paddingW,
+    int dilationT,
+    int dilationH,
+    int dilationW)
+{
+  const __hip_bfloat16* input = static_cast<const __hip_bfloat16*>(input_void);
+  __hip_bfloat16* output = static_cast<__hip_bfloat16*>(output_void);
+  const __hip_bfloat16* kernel = static_cast<const __hip_bfloat16*>(kernel_void);
+  const __hip_bfloat16* bias = static_cast<const __hip_bfloat16*>(bias_void);
+
+  const int channel_multiplier = oC / iC;
+  const int num_output = batch * oC * oT * oH * oW;
+
+  HIP_KERNEL_LOOP(index, num_output) {
+    const int out_col = index % oW;
+    const int out_row = (index / oW) % oH;
+    const int out_frame = (index / oW / oH) % oT;
+    const int out_channel = (index / oW / oH / oT) % oC;
+    const int b = index / oW / oH / oT / oC;
+
+    const int in_channel = out_channel / channel_multiplier;
+
+    const int in_col_start = out_col * strideW - paddingW;
+    const int in_row_start = out_row * strideH - paddingH;
+    const int in_frame_start = out_frame * strideT - paddingT;
+
+    float sum = 0.0f;
+    const __hip_bfloat16* kernel_ptr = kernel + out_channel * kT * kH * kW;
+    const int input_stride_c = iT * iH * iW;
+    const int input_stride_t = iH * iW;
+    const __hip_bfloat16* input_ptr = input + b * iC * input_stride_c
+                                      + in_channel * input_stride_c
+                                      + in_frame_start * input_stride_t
+                                      + in_row_start * iW
+                                      + in_col_start;
+
+    for (int k_frame = 0; k_frame < kT; ++k_frame) {
+      const int in_frame = in_frame_start + k_frame * dilationT;
+      for (int k_row = 0; k_row < kH; ++k_row) {
+        const int in_row = in_row_start + k_row * dilationH;
+        for (int k_col = 0; k_col < kW; ++k_col) {
+          const float op1 = (float)*(kernel_ptr++);
+          const int in_col = in_col_start + k_col * dilationW;
+          if (in_frame >= 0 && in_row >= 0 && in_col >= 0 &&
+              in_frame < iT && in_row < iH && in_col < iW) {
+            sum += op1 * (float)*input_ptr;
+          }
+          input_ptr += dilationW;
+        }
+        input_ptr += iW * dilationH - kW * dilationW;
+      }
+      input_ptr += iW * (iH * dilationT - kH * dilationH);
+    }
+    if (bias != nullptr) {
+      sum += (float)bias[out_channel];
+    }
+
+    const int output_stride_c = oT * oH * oW;
+    const int output_stride_t = oH * oW;
+    output[b * oC * output_stride_c + out_channel * output_stride_c
+           + out_frame * output_stride_t + out_row * oW + out_col] = (__hip_bfloat16)sum;
   }
 }
