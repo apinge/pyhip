@@ -588,6 +588,290 @@ __global__ void conv_depthwise3d_cuda_kernel_opt3_bf16(
   }
 }
 
+// Generalized opt3: runtime oT, oH, oW; dynamic shared memory. Kernel (kT,kH,kW) from args.
+// Launch: grid = batch*oC*oT, block = 256, smem = weight_size*sizeof(__fp16) + input_patch_size*sizeof(__fp16).
+__global__ void conv_depthwise3d_cuda_kernel_opt3_general(
+    const void* __restrict__ input_void,
+    void* __restrict__ output_void,
+    const void* __restrict__ kernel_void,
+    const void* __restrict__ bias_void,
+    int batch,
+    int iC,
+    int oC,
+    int iT,
+    int iH,
+    int iW,
+    int oT,
+    int oH,
+    int oW,
+    int kT,
+    int kH,
+    int kW,
+    int strideT,
+    int strideH,
+    int strideW,
+    int paddingT,
+    int paddingH,
+    int paddingW,
+    int dilationT,
+    int dilationH,
+    int dilationW)
+{
+  const __fp16* input = static_cast<const __fp16*>(input_void);
+  __fp16* output = static_cast<__fp16*>(output_void);
+  const __fp16* kernel = static_cast<const __fp16*>(kernel_void);
+  const __fp16* bias = static_cast<const __fp16*>(bias_void);
+
+  const int weight_size = kT * kH * kW;
+  const int in_tile_h = (oH - 1) * strideH + (kH - 1) * dilationH + 1;
+  const int in_tile_w = (oW - 1) * strideW + (kW - 1) * dilationW + 1;
+  const int in_tile_hw = in_tile_h * in_tile_w;
+  const int input_patch_size = kT * in_tile_hw;
+
+  extern __shared__ char smem_base[];
+  __fp16* s_weight = reinterpret_cast<__fp16*>(smem_base);
+  __fp16* s_input = reinterpret_cast<__fp16*>(smem_base + weight_size * sizeof(__fp16));
+
+  const int input_stride_c = iT * iH * iW;
+  const int input_stride_t = iH * iW;
+  const int output_stride_c = oT * oH * oW;
+  const int output_stride_t = oH * oW;
+
+  const int slice_idx = blockIdx.x;
+  const int b = slice_idx / (oC * oT);
+  const int rest = slice_idx % (oC * oT);
+  const int out_channel = rest / oT;
+  const int out_frame = rest % oT;
+
+  const int in_frame_start = out_frame * strideT - paddingT;
+  const int in_row_start = -paddingH;
+  const int in_col_start = -paddingW;
+
+  for (int base = threadIdx.x * 4; base < weight_size; base += blockDim.x * 4) {
+    if (base + 4 <= weight_size) {
+      const float16x4 v = *reinterpret_cast<const float16x4*>(kernel + out_channel * weight_size + base);
+      *reinterpret_cast<float16x4*>(&s_weight[base]) = v;
+    } else {
+      for (int i = 0; i < 4 && (base + i) < weight_size; ++i)
+        s_weight[base + i] = kernel[out_channel * weight_size + base + i];
+    }
+  }
+  __syncthreads();
+
+  const __fp16* input_base = input + b * iC * input_stride_c + out_channel * input_stride_c;
+  for (int base = threadIdx.x * 4; base < input_patch_size; base += blockDim.x * 4) {
+    const int kf = base / in_tile_hw;
+    const int hr = (base / in_tile_w) % in_tile_h;
+    const int wc = base % in_tile_w;
+    const int in_f = in_frame_start + kf * dilationT;
+    const int in_r = in_row_start + hr;
+    const int in_c = in_col_start + wc;
+    const bool can_vec = (wc + 4 <= in_tile_w) &&
+                        (in_f >= 0 && in_f < iT && in_r >= 0 && in_r < iH && in_c >= 0 && in_c + 4 <= iW);
+    if (can_vec) {
+      const size_t gaddr = (size_t)in_f * input_stride_t + (size_t)in_r * iW + in_c;
+      const float16x4 v = *reinterpret_cast<const float16x4*>(input_base + gaddr);
+      *reinterpret_cast<float16x4*>(&s_input[base]) = v;
+    } else {
+      for (int i = 0; i < 4 && (base + i) < input_patch_size; ++i) {
+        const int idx = base + i;
+        const int kfi = idx / in_tile_hw;
+        const int hri = (idx / in_tile_w) % in_tile_h;
+        const int wci = idx % in_tile_w;
+        const int in_fi = in_frame_start + kfi * dilationT;
+        const int in_ri = in_row_start + hri;
+        const int in_ci = in_col_start + wci;
+        float val = 0.0f;
+        if (in_fi >= 0 && in_fi < iT && in_ri >= 0 && in_ri < iH && in_ci >= 0 && in_ci < iW)
+          val = (float)input_base[in_fi * input_stride_t + in_ri * iW + in_ci];
+        s_input[idx] = (__fp16)val;
+      }
+    }
+  }
+  __syncthreads();
+
+  // Hot path: compile-time (3,5,5) for unrolling; dispatch only for this kernel size.
+  static constexpr int KT = 3, KH = 5, KW = 5, WEIGHT_SIZE = 75;
+  float weight_reg[WEIGHT_SIZE];
+  #pragma unroll
+  for (int w = 0; w < WEIGHT_SIZE; ++w) {
+    weight_reg[w] = (float)s_weight[w];
+  }
+
+  const int num_outputs = oH * oW;
+  #pragma unroll 2
+  for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
+    const int oh = out_linear / oW;
+    const int ow = out_linear % oW;
+    float sum = 0.0f;
+
+    float input_reg[WEIGHT_SIZE];
+    {
+      int wi_load = 0;
+      #pragma unroll
+      for (int kf = 0; kf < KT; ++kf) {
+        #pragma unroll
+        for (int kr = 0; kr < KH; ++kr) {
+          #pragma unroll
+          for (int kc = 0; kc < KW; ++kc, ++wi_load) {
+            const int hr = oh * strideH + kr * dilationH;
+            const int wc = ow * strideW + kc * dilationW;
+            const int in_idx = kf * in_tile_hw + hr * in_tile_w + wc;
+            input_reg[wi_load] = (float)s_input[in_idx];
+          }
+        }
+      }
+    }
+
+    int wi = 0;
+    #pragma unroll
+    for (int kf = 0; kf < KT; ++kf) {
+      #pragma unroll
+      for (int kr = 0; kr < KH; ++kr) {
+        #pragma unroll
+        for (int kc = 0; kc < KW; ++kc, ++wi) {
+          sum += weight_reg[wi] * input_reg[wi];
+        }
+      }
+    }
+    if (bias != nullptr) sum += (float)bias[out_channel];
+    output[b * oC * output_stride_c + out_channel * output_stride_c
+           + out_frame * output_stride_t + oh * oW + ow] = (__fp16)sum;
+  }
+}
+
+// Generalized opt3 BFloat16: runtime oT, oH, oW; dynamic smem. Hot path uses compile-time (3,5,5) so loops unroll.
+__global__ void conv_depthwise3d_cuda_kernel_opt3_bf16_general(
+    const void* __restrict__ input_void,
+    void* __restrict__ output_void,
+    const void* __restrict__ kernel_void,
+    const void* __restrict__ bias_void,
+    int batch,
+    int iC,
+    int oC,
+    int iT,
+    int iH,
+    int iW,
+    int oT,
+    int oH,
+    int oW,
+    int kT,
+    int kH,
+    int kW,
+    int strideT,
+    int strideH,
+    int strideW,
+    int paddingT,
+    int paddingH,
+    int paddingW,
+    int dilationT,
+    int dilationH,
+    int dilationW)
+{
+  const __hip_bfloat16* input = static_cast<const __hip_bfloat16*>(input_void);
+  __hip_bfloat16* output = static_cast<__hip_bfloat16*>(output_void);
+  const __hip_bfloat16* kernel = static_cast<const __hip_bfloat16*>(kernel_void);
+  const __hip_bfloat16* bias = static_cast<const __hip_bfloat16*>(bias_void);
+
+  const int weight_size = kT * kH * kW;
+  const int in_tile_h = (oH - 1) * strideH + (kH - 1) * dilationH + 1;
+  const int in_tile_w = (oW - 1) * strideW + (kW - 1) * dilationW + 1;
+  const int in_tile_hw = in_tile_h * in_tile_w;
+  const int input_patch_size = kT * in_tile_hw;
+
+  extern __shared__ char smem_base[];
+  __hip_bfloat16* s_weight = reinterpret_cast<__hip_bfloat16*>(smem_base);
+  __hip_bfloat16* s_input = reinterpret_cast<__hip_bfloat16*>(smem_base + weight_size * sizeof(__hip_bfloat16));
+
+  const int input_stride_c = iT * iH * iW;
+  const int input_stride_t = iH * iW;
+  const int output_stride_c = oT * oH * oW;
+  const int output_stride_t = oH * oW;
+
+  const int slice_idx = blockIdx.x;
+  const int b = slice_idx / (oC * oT);
+  const int rest = slice_idx % (oC * oT);
+  const int out_channel = rest / oT;
+  const int out_frame = rest % oT;
+
+  const int in_frame_start = out_frame * strideT - paddingT;
+  const int in_row_start = -paddingH;
+  const int in_col_start = -paddingW;
+
+  for (int base = threadIdx.x * 4; base < weight_size; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < weight_size; ++i)
+      s_weight[base + i] = kernel[out_channel * weight_size + base + i];
+  }
+  __syncthreads();
+
+  const __hip_bfloat16* input_base = input + b * iC * input_stride_c + out_channel * input_stride_c;
+  for (int base = threadIdx.x * 4; base < input_patch_size; base += blockDim.x * 4) {
+    for (int i = 0; i < 4 && (base + i) < input_patch_size; ++i) {
+      const int idx = base + i;
+      const int kfi = idx / in_tile_hw;
+      const int hri = (idx / in_tile_w) % in_tile_h;
+      const int wci = idx % in_tile_w;
+      const int in_fi = in_frame_start + kfi * dilationT;
+      const int in_ri = in_row_start + hri;
+      const int in_ci = in_col_start + wci;
+      float val = 0.0f;
+      if (in_fi >= 0 && in_fi < iT && in_ri >= 0 && in_ri < iH && in_ci >= 0 && in_ci < iW)
+        val = (float)input_base[in_fi * input_stride_t + in_ri * iW + in_ci];
+      s_input[idx] = (__hip_bfloat16)val;
+    }
+  }
+  __syncthreads();
+
+  // Hot path: use compile-time (3,5,5) so compiler unrolls; kernel is only dispatched for (3,5,5).
+  static constexpr int KT = 3, KH = 5, KW = 5, WEIGHT_SIZE = 75;
+  float weight_reg[WEIGHT_SIZE];
+  #pragma unroll
+  for (int w = 0; w < WEIGHT_SIZE; ++w) {
+    weight_reg[w] = (float)s_weight[w];
+  }
+
+  const int num_outputs = oH * oW;
+  #pragma unroll 2
+  for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += blockDim.x) {
+    const int oh = out_linear / oW;
+    const int ow = out_linear % oW;
+    float sum = 0.0f;
+
+    float input_reg[WEIGHT_SIZE];
+    {
+      int wi_load = 0;
+      #pragma unroll
+      for (int kf = 0; kf < KT; ++kf) {
+        #pragma unroll
+        for (int kr = 0; kr < KH; ++kr) {
+          #pragma unroll
+          for (int kc = 0; kc < KW; ++kc, ++wi_load) {
+            const int hr = oh * strideH + kr * dilationH;
+            const int wc = ow * strideW + kc * dilationW;
+            const int in_idx = kf * in_tile_hw + hr * in_tile_w + wc;
+            input_reg[wi_load] = (float)s_input[in_idx];
+          }
+        }
+      }
+    }
+
+    int wi = 0;
+    #pragma unroll
+    for (int kf = 0; kf < KT; ++kf) {
+      #pragma unroll
+      for (int kr = 0; kr < KH; ++kr) {
+        #pragma unroll
+        for (int kc = 0; kc < KW; ++kc, ++wi) {
+          sum += weight_reg[wi] * input_reg[wi];
+        }
+      }
+    }
+    if (bias != nullptr) sum += (float)bias[out_channel];
+    output[b * oC * output_stride_c + out_channel * output_stride_c
+           + out_frame * output_stride_t + oh * oW + ow] = (__hip_bfloat16)sum;
+  }
+}
+
 __global__ void conv_depthwise3d_cuda_kernel_reference(
     const void* input_void,
     void* output_void,
