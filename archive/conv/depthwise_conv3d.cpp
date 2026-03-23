@@ -1024,7 +1024,7 @@ for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += block
     }
   }
   #if defined(__HIP_DEVICE_COMPILE__) && defined(__clang__) && defined(__gfx950__) && \
-    (__has_builtin(__builtin_amdgcn_fdot2_f32_bf16) || __has_builtin(__builtin_amdgcn_fdot2))
+    __has_builtin(__builtin_amdgcn_fdot2_f32_bf16) 
     // if constexpr (std::is_same_v<scalar_t, c10::BFloat16>) {
     if constexpr (std::is_same_v<__hip_bfloat16, __hip_bfloat16>) { // no ops on bf16
       // 2 × bf16 dot → f32 acc (AMDGCN dot2). Needs supported gfx + compile flags.
@@ -1036,7 +1036,7 @@ for (int out_linear = threadIdx.x; out_linear < num_outputs; out_linear += block
         sum = __builtin_amdgcn_fdot2_f32_bf16(wa, xi, sum, false);
       }
     }
-    if (WEIGHT_SIZE % 2 == 1) {
+    if (WEIGHT_SIZE &1) {
       const int w = WEIGHT_SIZE - 1;
       sum += static_cast<float>(weight_reg[w]) * static_cast<float>(input_reg[w]);
     }
@@ -1185,7 +1185,7 @@ __global__ void conv_depthwise3d_cuda_kernel_opt3_fp16_general_vec_dot(
           pack_f16x2(input_reg[w + 0], input_reg[w + 1]);
       sum = __builtin_amdgcn_fdot2(wa, xi, sum, false);
     }
-    if (WEIGHT_SIZE % 2 == 1) {
+    if (WEIGHT_SIZE&1) {
       const int w = WEIGHT_SIZE - 1;
       sum += static_cast<float>(weight_reg[w]) *
              static_cast<float>(input_reg[w]);
