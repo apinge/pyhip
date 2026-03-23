@@ -287,6 +287,28 @@ def test_conv3d_benchmark(args):
                 sharedMemBytes=smem,
             )
             return output_tensor
+    
+    def run_custom_conv3d_opt3_bf16_general_vec_dot():
+        """Generalized opt3 bf16: any (oT, oH, oW); dynamic shared memory."""
+        with torch.no_grad():
+            output_tensor = torch.zeros(B, C_out, D_out, H_out, W_out, device=device, dtype=input_dtype)
+            grid_dim = B * C_out * D_out
+            kT, kH, kW = kernel_size[0], kernel_size[1], kernel_size[2]
+            smem = _smem_bytes_opt3_general()
+            hip.conv_depthwise3d_cuda_kernel_opt3_bf16_general_vec_dot(
+                [grid_dim], [256],
+                input_tensor.data_ptr(),
+                output_tensor.data_ptr(),
+                weight_tensor.data_ptr(),
+                bias_tensor.data_ptr(),
+                B, C_in, C_out, D, H, W, D_out, H_out, W_out,
+                kT, kH, kW,
+                stride[0], stride[1], stride[2],
+                padding[0], padding[1], padding[2],
+                dilation[0], dilation[1], dilation[2],
+                sharedMemBytes=smem,
+            )
+            return output_tensor
 
     def run_custom_conv3d_opt3_general():
         """Generalized opt3 fp16: any (oT, oH, oW); dynamic shared memory. Use only when input_dtype is torch.float16."""
@@ -319,7 +341,7 @@ def test_conv3d_benchmark(args):
     # custom_opt3_ms, custom_opt3_tflops, custom_opt3_warmup_ms = benchmark_op(run_custom_conv3d_opt3, f"Custom Conv3d Opt3 ({args.shape})", args.iters, gflops, device)
     custom_opt3_bf16_ms, custom_opt3_bf16_tflops, custom_opt3_bf16_warmup_ms = benchmark_op(run_custom_conv3d_opt3_bf16, f"Custom Conv3d Opt3 BF16 ({args.shape})", args.iters, gflops, device)
     custom_opt3_bf16_general_ms, custom_opt3_bf16_general_tflops, custom_opt3_bf16_general_warmup_ms = benchmark_op(run_custom_conv3d_opt3_bf16_general, f"Custom Conv3d Opt3 BF16 general ({args.shape})", args.iters, gflops, device)
-
+    custom_opt3_bf16_general_vec_dot_ms, custom_opt3_bf16_general_vec_dot_tflops, custom_opt3_bf16_general_vec_dot_warmup_ms = benchmark_op(run_custom_conv3d_opt3_bf16_general_vec_dot, f"Custom Conv3d Opt3 BF16 general vec dot ({args.shape})", args.iters, gflops, device)
     # 3. 汇总对比
     print(f"\n--- 性能对比汇总 ({args.shape}) ---")
     print(f"{'方法':<35} | {'平均耗时 (ms)':<15} | {'吞吐量 (TFLOPS)':<15} | {'预热/Tune (ms)':<15}")
@@ -330,8 +352,9 @@ def test_conv3d_benchmark(args):
     # print(f"{'Custom Conv3d Opt1':<35} | {custom_opt1_ms:>15.4f} | {custom_opt1_tflops:>15.2f} | {custom_opt1_warmup_ms:>15.2f}")
     # print(f"{'Custom Conv3d Opt2':<35} | {custom_opt2_ms:>15.4f} | {custom_opt2_tflops:>15.2f} | {custom_opt2_warmup_ms:>15.2f}")
     #print(f"{'Custom Conv3d Opt3':<35} | {custom_opt3_ms:>15.4f} | {custom_opt3_tflops:>15.2f} | {custom_opt3_warmup_ms:>15.2f}")
-    print(f"{'Custom Conv3d Opt3 BF16':<35} | {custom_opt3_bf16_ms:>15.4f} | {custom_opt3_bf16_tflops:>15.2f} | {custom_opt3_bf16_warmup_ms:>15.2f}")
+    #print(f"{'Custom Conv3d Opt3 BF16':<35} | {custom_opt3_bf16_ms:>15.4f} | {custom_opt3_bf16_tflops:>15.2f} | {custom_opt3_bf16_warmup_ms:>15.2f}")
     print(f"{'Custom Conv3d Opt3 BF16 general':<35} | {custom_opt3_bf16_general_ms:>15.4f} | {custom_opt3_bf16_general_tflops:>15.2f} | {custom_opt3_bf16_general_warmup_ms:>15.2f}")
+    print(f"{'Custom Conv3d Opt3 BF16 general vec dot':<35} | {custom_opt3_bf16_general_vec_dot_ms:>15.4f} | {custom_opt3_bf16_general_vec_dot_tflops:>15.2f} | {custom_opt3_bf16_general_vec_dot_warmup_ms:>15.2f}")
 
     print(f"Run Accuracy check for {args.shape}...")
     ref = run_torch_conv3d()
@@ -340,8 +363,8 @@ def test_conv3d_benchmark(args):
     # ret = run_custom_conv3d_opt1()
     # ret = run_custom_conv3d_opt2()
     # ret = run_custom_conv3d_opt3()
-    ret = run_custom_conv3d_opt3_bf16_general()
-    
+    # ret = run_custom_conv3d_opt3_bf16_general()
+    ret = run_custom_conv3d_opt3_bf16_general_vec_dot()
     print(ret.shape, ret.dtype)
     all_diff = pyhip.calc_diff(ref, ret)
     if all_diff > 0.001:
