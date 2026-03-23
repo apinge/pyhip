@@ -40,6 +40,8 @@ except ImportError:
 if torch is None or not torch.cuda.is_available():
     pytest.skip("CUDA/ROCm not available. Skipping GPU tests.", allow_module_level=True)
 
+import torch.nn.functional as F
+
 from rmsnorm_kernel import build_rmsnorm_module
 
 DTYPE_FP32 = torch.float32
@@ -127,6 +129,23 @@ def maybe_enable_aiter() -> bool:
     return False
 
 
+def run_torch(input, weight, eps, residual=None):
+    if residual is None:
+        residual_out = None
+        output = F.rms_norm(
+            input=input, normalized_shape=(input.shape[-1],), weight=weight, eps=eps
+        )
+    else:
+        residual_out = input + residual
+        output = F.rms_norm(
+            input=residual_out,
+            normalized_shape=(input.shape[-1],),
+            weight=weight,
+            eps=eps,
+        )
+    return output, residual_out
+
+
 def run_test(M: int, N: int, dtype: str = "f32"):
     print(f"\nTesting RMSNorm (M={M}, N={N}, dtype={dtype})")
 
@@ -163,11 +182,7 @@ def run_test(M: int, N: int, dtype: str = "f32"):
     else:
         raise ValueError(f"unsupported dtype: {dtype}")
 
-    x = input_ref
-    gamma = gamma_ref
-    sq_mean = (x * x).mean(dim=1, keepdim=True)
-    rms = torch.sqrt(sq_mean + EPS)
-    expected = (x / rms) * gamma
+    expected, _ = run_torch(input_ref, gamma_ref, EPS, None)
     expected = expected.to(DTYPE_FP32)
 
     print("Launching kernel...")
