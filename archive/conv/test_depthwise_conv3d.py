@@ -1,4 +1,3 @@
-from audioop import bias
 import pyhip
 hip = pyhip.module("depthwise_conv3d.cpp", "-g -O3")
 
@@ -103,7 +102,6 @@ def test_conv3d_benchmark(args):
     weight_tensor = torch.randn(C_out, C_in // groups, *kernel_size).to(dtype=input_dtype).to(device)
     bias_tensor = torch.randn(C_out).to(dtype=input_dtype).to(device)
   
-
     # 内存格式处理
     # try:
     #     input_tensor = input_tensor.contiguous(memory_format=torch.channels_last_3d)
