@@ -284,16 +284,15 @@ def run_test_fused_add(M: int, N: int, dtype: str = "f32"):
     print("Launching rmsnorm_fusedadd_kernel...")
     stream = torch.cuda.current_stream()
 
-    def kernel_launch():
-        # TODO 这个地方测性能会有问题
-        residual_dev.copy_(residual_backup)
+    def kernel_launch_bench():
+        """仅测 kernel；不在此恢复 residual，避免把整块 copy_ 算进耗时。"""
         launch_fn(input_dev, gamma_dev, residual_dev, output_dev, M, stream=stream)
 
-    _, avg_us = run_perftest_simple(kernel_launch, num_iters=BENCH_ITERS, num_warmup=WARMUP_ITERS)
+    _, avg_us = run_perftest_simple(kernel_launch_bench, num_iters=BENCH_ITERS, num_warmup=WARMUP_ITERS)
     torch.cuda.synchronize()
     flydsl_gpu_us = None
     if os.environ.get("ROCDSL_COMPARE_AITER", "0") == "1":
-        flydsl_gpu_us = bench_gpu_us_torch(kernel_launch, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
+        flydsl_gpu_us = bench_gpu_us_torch(kernel_launch_bench, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
     avg_ms = avg_us / 1000.0
 
     elem_bytes = 4 if dtype == "f32" else 2
@@ -304,6 +303,11 @@ def run_test_fused_add(M: int, N: int, dtype: str = "f32"):
     print(f"Bandwidth: {bandwidth_gbs:.2f} GB/s")
     if flydsl_gpu_us is not None:
         print(f"[Perf] FlyDSL rmsnorm gpu: {flydsl_gpu_us:.1f} us")
+
+    # 正确性：从备份恢复 residual 后单次 launch（与 perf 分开，避免 copy_ 污染计时）
+    residual_dev.copy_(residual_backup)
+    launch_fn(input_dev, gamma_dev, residual_dev, output_dev, M, stream=stream)
+    torch.cuda.synchronize()
 
     output_ref = output_dev.to(DTYPE_FP32)
     error = (output_ref - expected).abs().max().item()
@@ -379,7 +383,7 @@ def test_all():
         #     failures += 1
         # 暂时屏蔽掉 rmsnorm 测试，为了开发方便
 
-        ok_1, flydsl_gpu_us_fusedadd = run_test_fused_add(M, N, dtype)
+        ok_1, flydsl_gpu_us = run_test_fused_add(M, N, dtype)
         if not ok_1:
             failures += 1
 
@@ -387,19 +391,25 @@ def test_all():
             aiter_us = None
             aiter_rms_norm_us = None
             if maybe_enable_aiter():
-                from aiter import rms_norm as aiter_ck_rmsnorm
-
+                #from aiter import rms_norm as aiter_ck_rmsnorm
+                from aiter import  rmsnorm2d_fwd_with_add as aiter_ck_rmsnorm2d_fwd_with_add
                 x = torch.randn(
                     (M, N),
                     device="cuda",
                     dtype=DTYPE_BF16 if dtype == "bf16" else (DTYPE_FP16 if dtype == "f16" else DTYPE_FP32),
                 )
                 w = torch.rand((N,), device="cuda", dtype=x.dtype)
-                try:
-                    from aiter.ops.triton.rmsnorm import rms_norm as aiter_rms_norm
+                output = torch.empty_like(x)
+                res = torch.randn((M, N), dtype=x.dtype, device="cuda")
+                res_out = torch.empty_like(res)
 
+                try:
+                   # from aiter.ops.triton.rmsnorm import rms_norm as aiter_rms_norm
+                    from aiter.ops.triton.normalization.rmsnorm import rmsnorm2d_fwd_with_add
                     def run_aiter_triton():
-                        aiter_rms_norm(x, w, EPS)
+                         rmsnorm2d_fwd_with_add(
+                            output, x, res, res_out, w, EPS,
+                        )
 
                     aiter_us = bench_gpu_us_torch(run_aiter_triton, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
                     print(f"[Perf] AIter Triton rmsnorm gpu: {aiter_us:.1f} us")
@@ -408,7 +418,7 @@ def test_all():
                 try:
 
                     def run_aiter_ck_rmsnorm():
-                        aiter_ck_rmsnorm(x, w, EPS, 0)
+                        aiter_ck_rmsnorm2d_fwd_with_add(output, x, res, res_out, w, EPS, 0)
 
                     aiter_rms_norm_us = bench_gpu_us_torch(run_aiter_ck_rmsnorm, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
                     print(f"[Perf] aiter.rms_norm (CK) gpu: {aiter_rms_norm_us:.1f} us")
