@@ -626,8 +626,8 @@ def build_rmsnorm_fusedadd_module(M: int, N: int, dtype_str: str):
                     fused_st = x_f if dtype_str == "f32" else x_f.truncf(elem_type)
                     _store_scalar(res_div, idx, fused_st)
 
-            # pass1 写全局 residual，pass2 再读；无 barrier 时不同 warp 会乱序，读到未写完的数据
-            gpu.barrier()
+            # 无 barrier 时不同 warp 会乱序，读到未写完的数据吗 TODO investigate
+            # gpu.barrier()
 
             sum_sq = block_reduce_add(thread_sumsq)
             mean_sq = ArithValue(sum_sq) / n_float
