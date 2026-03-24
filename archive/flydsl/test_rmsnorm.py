@@ -296,7 +296,7 @@ def run_test_fused_add(M: int, N: int, dtype: str = "f32"):
     avg_ms = avg_us / 1000.0
 
     elem_bytes = 4 if dtype == "f32" else 2
-    total_bytes = 2 * M * N * elem_bytes
+    total_bytes = 2 * M * N * elem_bytes *2 # residual+input
     bandwidth_gbs = total_bytes / (avg_us / 1e6) / 1e9
 
     print(f"Kernel avg time: {avg_ms:.4f} ms (warmup={WARMUP_ITERS}, iters={BENCH_ITERS})")
