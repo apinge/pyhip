@@ -366,8 +366,11 @@ def test_all():
             # (1, 4096, "f32"),
             # (1, 4096, "f16"),
             # (1, 4096, "bf16"),
-            # (32768,256, "bf16"),
-            # (8000,256, "bf16"),
+            (32768,4096, "bf16"),
+            (8000,4096, "bf16"),
+            (8,4096, "bf16"),
+            (4,4096, "bf16"),
+            (2,4096, "bf16"),
             # (8,256, "bf16"),
             # (4,256, "bf16"),
             # (2,256, "bf16"),
@@ -412,22 +415,22 @@ def test_all():
                         )
 
                     aiter_us = bench_gpu_us_torch(run_aiter_triton, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
-                    print(f"[Perf] AIter Triton rmsnorm gpu: {aiter_us:.1f} us")
+                    print(f"[Perf] AIter Triton rmsnorm fused add gpu: {aiter_us:.1f} us")
                 except Exception as e:
-                    print(f"[Perf] AIter Triton rmsnorm skipped: {type(e).__name__}: {e!r}")
+                    print(f"[Perf] AIter Triton rmsnorm fused add skipped: {type(e).__name__}: {e!r}")
                 try:
 
                     def run_aiter_ck_rmsnorm():
                         aiter_ck_rmsnorm2d_fwd_with_add(output, x, res, res_out, w, EPS, 0)
 
                     aiter_rms_norm_us = bench_gpu_us_torch(run_aiter_ck_rmsnorm, warmup=WARMUP_ITERS, iters=BENCH_ITERS)
-                    print(f"[Perf] aiter.rms_norm (CK) gpu: {aiter_rms_norm_us:.1f} us")
+                    print(f"[Perf] aiter.rms_norm fused add (CK) gpu: {aiter_rms_norm_us:.1f} us")
                 except Exception as e:
-                    print(f"[Perf] aiter.rms_norm skipped: {type(e).__name__}: {e!r}")
+                    print(f"[Perf] aiter.rms_norm fused add skipped: {type(e).__name__}: {e!r}")
 
             perf_rows.append(
                 PerfRow(
-                    op="rmsnorm",
+                    op="rmsnorm fused add",
                     shape=f"{M}x{N}",
                     dtype=dtype,
                     flydsl_gpu_us=flydsl_gpu_us,
