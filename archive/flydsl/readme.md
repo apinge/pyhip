@@ -12,6 +12,9 @@ python3 test_rmsnorm.py
 
 https://mlir.llvm.org/docs/Dialects/ROCDLDialect/
 
+## Translate Triton to FlyDSL
+
+https://github.com/coderfeli/claudeskill/blob/main/triton-to-flydsl.md
 
 ## perf test on MI308
 
