@@ -1,4 +1,4 @@
-// A: 16x32, B: 32x16, D: 16x16, Out: 16x16 — row-major fp16。语义: Out = (A @ B) * D（实现留空）
+// A: 16x32, B: 32x16, D: 16x16, Out: 16x16 — row-major fp16。语义: Out = (A @ B) @ D
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 
