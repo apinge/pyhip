@@ -10,7 +10,6 @@ hip = pyhip.module(os.path.join(_DIR, "AB_swap.cpp"))
 
 
 def torch_ref(A: torch.Tensor, B: torch.Tensor, D: torch.Tensor) -> torch.Tensor:
-    """Out = (A @ B) @ D，与 kernel 约定一致；用 fp32 累加再回 fp16。"""
     return (A @ B) @ D # 结果是dtype fp16
 
 
