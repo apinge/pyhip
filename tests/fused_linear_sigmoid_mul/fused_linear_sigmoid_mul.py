@@ -204,7 +204,7 @@ def main():
     times_triton = []
     for _ in range(10):
         with pyhip.cudaPerf(
-            rw_bytes=rw_bytes, name="triton_impl_fused_sigmoid_mul_broadcast", verbose=1
+            rw_bytes=rw_bytes, name="fused_linear_sigmoid_mul_triton", verbose=1
         ) as p:
             triton_impl(x, W, b, m, out=out_bench)
         times_triton.append(p.dt_ms)
