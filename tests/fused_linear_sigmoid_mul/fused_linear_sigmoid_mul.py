@@ -89,6 +89,10 @@ def fused_linear_sigmoid_mul_triton_impl(
     assert weight.shape == (1, h)
     if output is None:
         output = torch.empty_like(shared_output)
+    assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
+    assert weight.is_contiguous(), "weight must be contiguous"
+    assert shared_output.is_contiguous(), "shared_output must be contiguous"
+    assert output.is_contiguous(), "output must be contiguous"
     block_h = 2048
     grid = (triton.cdiv(n, 1),)
     fused_linear_sigmoid_mul_triton[grid](
@@ -118,6 +122,7 @@ def triton_impl(
     assert bias is None, "fused triton kernel 当前未加 bias"
     # if out is None:
     #     out = torch.empty_like(shared_output)
+    
     fused_linear_sigmoid_mul_triton_impl(hidden_states, weight, shared_output, out=out)
     return out
 
