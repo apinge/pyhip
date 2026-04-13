@@ -248,16 +248,17 @@ if __name__ == '__main__':
     #TILE_M = 16
     #TILE_N = 128
     # qwen3 235b/a22b qkv projection
-    N, K = 9216, 4096
-    # qwen3 235b/a22b qkv projection
-    N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
-    if 1:
-        # UP&GATE: [2*intemediate*experts//tp8, hidden_states],
-        N, K = 256*512, 2048
-    else:
-        # DOWN:[hiddenstates*experts, intemediate//tp8],
-        N, K = 4096*512, 128*4
-    # Ms = [1,2, 4, 8, 16, 32, 64]
+    # N, K = 9216, 4096
+    # # qwen3 235b/a22b qkv projection
+    # N, K = 4096*8*2, 8192 # 4096*8*2 /128 = 512
+    # if 1:
+    #     # UP&GATE: [2*intemediate*experts//tp8, hidden_states],
+    #     N, K = 256*512, 2048
+    # else:
+    #     # DOWN:[hiddenstates*experts, intemediate//tp8],
+    #     N, K = 4096*512, 128*4
+    # # Ms = [1,2, 4, 8, 16, 32, 64]
+    M, N, K = 16, 5120, 3072
     Ms = [16]
     perf = {}
     dict_tile_mn = {}

@@ -71,3 +71,28 @@ def get_cu_id():
         pack=1,
     )
     return (cu_id, se_id, xcc_id, slot_id)
+
+
+@gluon.jit
+def amd_warp_id():
+    """CTA 内逻辑 warp 下标，等价于 HIP 里 ``threadIdx.x / 64``（同一 wave 内为 uniform SGPR）。
+
+    开源 Triton 的 ``triton.experimental.gluon.language.amd.cdna3`` 往往**没有** ``warp_id()``；
+    原先内部/定制版里的 ``gl.amd.cdna3.warp_id()`` 可用本函数替代。
+
+    实现：假定 LLVM AMDGPU 内核约定下 **v0 为 X 维 work-item id**（与 ROCm/llvm 常见 compute kernel ABI 一致），
+    再 ``v >> 6`` 后 ``v_readfirstlane`` 得到标量。若你使用的编译器/ABI 不同，请核对反汇编中的 v0 含义后改 asm。
+    """
+    wid = gl.inline_asm_elementwise(
+        asm="""
+        v_lshrrev_b32_e32 v31, 6, v0
+        v_readfirstlane_b32 $0, v31
+        s_waitcnt lgkmcnt(0)
+        """,
+        constraints="=s",
+        args=[],
+        dtype=gl.int32,
+        is_pure=False,
+        pack=1,
+    )
+    return wid
