@@ -28,8 +28,14 @@ def gen_timing(p_debug_buf: torch.Tensor, access_size_wg, flops_wg):
     infos = []
     buf_us = buf_us.reshape(-1, 4)
     buf_cycle = buf_cycle.reshape(-1, 4)
-    freqs = (buf_cycle[:, 3] - buf_cycle[:, 0]) / (buf_us[:, 3] - buf_us[:, 0]) / 1000
-    durs = buf_us[:, 3] - buf_us[:, 0]
+    dt_us = buf_us[:, 3] - buf_us[:, 0]
+    dtc = buf_cycle[:, 3] - buf_cycle[:, 0]
+    freqs = torch.where(
+        dt_us.abs() > 1e-12,
+        dtc / dt_us / 1000,
+        torch.full_like(dt_us, float("nan"), dtype=torch.float64, device=dt_us.device),
+    )
+    durs = dt_us
     cyc_durs = buf_cycle[:, 3] - buf_cycle[:, 0]
     cyc_pros = buf_cycle[:, 1] - buf_cycle[:, 0]
     cyc_loops = buf_cycle[:, 2] - buf_cycle[:, 1]
@@ -38,8 +44,17 @@ def gen_timing(p_debug_buf: torch.Tensor, access_size_wg, flops_wg):
     time_loops = buf_us[:, 2] - buf_us[:, 1]
     time_epis = buf_us[:, 3] - buf_us[:, 2]
 
-    bws = access_size_wg / (durs * 1000)  # unit is GB/s
-    gflops = flops_wg / (durs * 1000)     # unit is GFLOPS
+    eps = 1e-12
+
+    def _safe_div(num, den):
+        den = float(den)
+        if abs(den) < eps:
+            return float("nan")
+        return num / den
+
+    nan_like_durs = torch.full_like(durs, float("nan"), dtype=durs.dtype, device=durs.device)
+    bws = torch.where(durs.abs() > eps, access_size_wg / (durs * 1000), nan_like_durs)  # unit is GB/s
+    gflops = torch.where(durs.abs() > eps, flops_wg / (durs * 1000), nan_like_durs)  # unit is GFLOPS
     for i in range(buf_us.shape[0]):
         hw_ids = cu_buf[i].item()
         logic_cu_id = cu_ids_logic_lookup[hw_ids]
@@ -67,15 +82,18 @@ def gen_timing(p_debug_buf: torch.Tensor, access_size_wg, flops_wg):
                 }}'''
         infos.append(info)
 
-        info = f'''{{ "ph": "B", "name": "pro", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 0]}, "args": {{"cyc":{cyc_pros[i]}, "pro/all":"{time_pros[i] / durs[i] * 100:.2f}%"}} }}'''
+        _pct_pro = _safe_div(time_pros[i].item(), durs[i].item()) * 100 if abs(durs[i].item()) > eps else float("nan")
+        info = f'''{{ "ph": "B", "name": "pro", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 0]}, "args": {{"cyc":{cyc_pros[i]}, "pro/all":"{_pct_pro:.2f}%"}} }}'''
         infos.append(info)
         info = f'''{{ "ph": "E", "name": "pro", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 1]}, "args": {{}} }}'''
         infos.append(info)
-        info = f'''{{ "ph": "B", "name": "loop", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 1]}, "args": {{"cyc":{cyc_loops[i]}, "loop/all":"{time_loops[i] / durs[i] * 100:.2f}%"}} }}'''
+        _pct_loop = _safe_div(time_loops[i].item(), durs[i].item()) * 100 if abs(durs[i].item()) > eps else float("nan")
+        info = f'''{{ "ph": "B", "name": "loop", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 1]}, "args": {{"cyc":{cyc_loops[i]}, "loop/all":"{_pct_loop:.2f}%"}} }}'''
         infos.append(info)
         info = f'''{{ "ph": "E", "name": "loop", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 2]}, "args": {{}} }}'''
         infos.append(info)
-        info = f'''{{ "ph": "B", "name": "epi", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 2]}, "args": {{"cyc":{cyc_epis[i]}, "epi/all":"{time_epis[i] / durs[i] * 100:.2f}%"}} }}'''
+        _pct_epi = _safe_div(time_epis[i].item(), durs[i].item()) * 100 if abs(durs[i].item()) > eps else float("nan")
+        info = f'''{{ "ph": "B", "name": "epi", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 2]}, "args": {{"cyc":{cyc_epis[i]}, "epi/all":"{_pct_epi:.2f}%"}} }}'''
         infos.append(info)
         info = f'''{{ "ph": "E", "name": "epi", "pid": {0}, "tid": {logic_cu_id}, "ts": {buf_us[i, 3]}, "args": {{}} }}'''
         infos.append(info)
@@ -90,38 +108,46 @@ def gen_timing(p_debug_buf: torch.Tensor, access_size_wg, flops_wg):
     durs_median = torch.median(durs, dim=0, keepdim=False)
     print(f'\nmemory access size per wg: {access_size_wg / 1024:.2f} KB, flops per wg: {flops_wg / 1e6:.2f} MFlops, per wg statis:')
     print(f'{"item":<13s} {"all(us)":>10s} {"prolog(us)":>15s} {"loop(us)":>18s} {"epi(us)":>15s} {"freq(GHz)":>10s} {"bw(GB/s)":>10s} {"GFlops/s":>10s} {"all.cyc":>15s} {"pro.cyc":>10s} {"loop.cyc":>15s} {"epi.cyc":>10s}')
-    str_pros = f'{time_pros.mean():.2f}({time_pros.mean() / durs_mean * 100:.2f}%)'
-    str_loops = f'{time_loops.mean():.2f}({time_loops.mean() / durs_mean * 100:.2f}%)'
-    str_epis = f'{time_epis.mean():.2f}({time_epis.mean() / durs_mean * 100:.2f}%)'
-    print(f'{"mean":<13s} {durs_mean:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs_mean:>10.2f} {access_size_wg / 1024 / durs_mean:>10.2f} {flops_wg / 1000 / durs_mean:>10.2f} {cyc_durs_mean:>15,.0f} {cyc_pros.to(torch.float32).mean():>10,.0f} {cyc_loops.to(torch.float32).mean():>15,.0f} {cyc_epis.to(torch.float32).mean():>10,.0f}')
+    m_pro = _safe_div(time_pros.mean().item(), durs_mean) * 100
+    m_loop = _safe_div(time_loops.mean().item(), durs_mean) * 100
+    m_epi = _safe_div(time_epis.mean().item(), durs_mean) * 100
+    str_pros = f'{time_pros.mean():.2f}({m_pro:.2f}%)'
+    str_loops = f'{time_loops.mean():.2f}({m_loop:.2f}%)'
+    str_epis = f'{time_epis.mean():.2f}({m_epi:.2f}%)'
+    bw_mean = _safe_div(access_size_wg / 1024, durs_mean)
+    gflops_mean = _safe_div(flops_wg / 1000, durs_mean)
+    print(f'{"mean":<13s} {durs_mean:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs_mean:>10.2f} {bw_mean:>10.2f} {gflops_mean:>10.2f} {cyc_durs_mean:>15,.0f} {cyc_pros.to(torch.float32).mean():>10,.0f} {cyc_loops.to(torch.float32).mean():>15,.0f} {cyc_epis.to(torch.float32).mean():>10,.0f}')
     detail_idx = durs_median[1]
     detail_val = durs_median[0].item()
     hw_ids = cu_buf[detail_idx].item()
     logic_cu_id = cu_ids_logic_lookup[hw_ids]
     header = f'median({logic_cu_id})'
-    str_pros = f'{time_pros[detail_idx]:.2f}({time_pros[detail_idx] / detail_val * 100:.2f}%)'
-    str_loops = f'{time_loops[detail_idx]:.2f}({time_loops[detail_idx] / detail_val * 100:.2f}%)'
-    str_epis = f'{time_epis[detail_idx]:.2f}({time_epis[detail_idx] / detail_val * 100:.2f}%)'
-    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {access_size_wg / 1000 / detail_val:>10.2f} {flops_wg / 1000 / detail_val:>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
+    dv = detail_val
+    str_pros = f'{time_pros[detail_idx]:.2f}({_safe_div(time_pros[detail_idx].item(), dv) * 100:.2f}%)'
+    str_loops = f'{time_loops[detail_idx]:.2f}({_safe_div(time_loops[detail_idx].item(), dv) * 100:.2f}%)'
+    str_epis = f'{time_epis[detail_idx]:.2f}({_safe_div(time_epis[detail_idx].item(), dv) * 100:.2f}%)'
+    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {_safe_div(access_size_wg / 1000, detail_val):>10.2f} {_safe_div(flops_wg / 1000, detail_val):>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
 
     detail_idx = durs_max[1]
     detail_val = durs_max[0].item()
     hw_ids = cu_buf[detail_idx].item()
     logic_cu_id = cu_ids_logic_lookup[hw_ids]
     header = f'max({logic_cu_id})'
-    str_pros = f'{time_pros[detail_idx]:.2f}({time_pros[detail_idx] / detail_val * 100:.2f}%)'
-    str_loops = f'{time_loops[detail_idx]:.2f}({time_loops[detail_idx] / detail_val * 100:.2f}%)'
-    str_epis = f'{time_epis[detail_idx]:.2f}({time_epis[detail_idx] / detail_val * 100:.2f}%)'
-    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {access_size_wg / 1000 / detail_val:>10.2f} {flops_wg / 1000 / detail_val:>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
+    dv = detail_val
+    str_pros = f'{time_pros[detail_idx]:.2f}({_safe_div(time_pros[detail_idx].item(), dv) * 100:.2f}%)'
+    str_loops = f'{time_loops[detail_idx]:.2f}({_safe_div(time_loops[detail_idx].item(), dv) * 100:.2f}%)'
+    str_epis = f'{time_epis[detail_idx]:.2f}({_safe_div(time_epis[detail_idx].item(), dv) * 100:.2f}%)'
+    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {_safe_div(access_size_wg / 1000, detail_val):>10.2f} {_safe_div(flops_wg / 1000, detail_val):>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
     detail_idx = durs_min[1]
     detail_val = durs_min[0].item()
     hw_ids = cu_buf[detail_idx].item()
     logic_cu_id = cu_ids_logic_lookup[hw_ids]
     header = f'min({logic_cu_id})'
-    str_pros = f'{time_pros[detail_idx]:.2f}({time_pros[detail_idx] / detail_val * 100:.2f}%)'
-    str_loops = f'{time_loops[detail_idx]:.2f}({time_loops[detail_idx] / detail_val * 100:.2f}%)'
-    str_epis = f'{time_epis[detail_idx]:.2f}({time_epis[detail_idx] / detail_val * 100:.2f}%)'
-    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {access_size_wg / 1000 / detail_val:>10.2f} {flops_wg / 1000 / detail_val:>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
+    dv = detail_val
+    str_pros = f'{time_pros[detail_idx]:.2f}({_safe_div(time_pros[detail_idx].item(), dv) * 100:.2f}%)'
+    str_loops = f'{time_loops[detail_idx]:.2f}({_safe_div(time_loops[detail_idx].item(), dv) * 100:.2f}%)'
+    str_epis = f'{time_epis[detail_idx]:.2f}({_safe_div(time_epis[detail_idx].item(), dv) * 100:.2f}%)'
+    print(f'{header:<13s} {detail_val:>10.2f} {str_pros:>15s} {str_loops:>18s} {str_epis:>15s} {freqs[detail_idx]:>10.2f} {_safe_div(access_size_wg / 1000, detail_val):>10.2f} {_safe_div(flops_wg / 1000, detail_val):>10.2f} {cyc_durs[detail_idx]:>15,.0f} {cyc_pros[detail_idx]:>10,.0f} {cyc_loops[detail_idx]:>15,.0f} {cyc_epis[detail_idx]:>10,.0f}')
     with open('statis.json', 'w') as f:
         s = '{"traceEvents":[' + ','.join(infos) + "]}"
         f.write(s)

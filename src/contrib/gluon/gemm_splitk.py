@@ -6,15 +6,15 @@ from functools import cache
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from triton.experimental.gluon.language.amd.cdna3 import (
-        sched_barrier as _amd_iglp_sched_barrier,
-    )
+# from triton.experimental.gluon.language.amd.cdna3 import (
+#         sched_barrier as _amd_iglp_sched_barrier,
+#     )
 
-from triton.experimental.gluon.language.amd.cdna3 import (
-    sched_group_barrier as _amd_iglp_sched_group_barrier,
-)
+# from triton.experimental.gluon.language.amd.cdna3 import (
+#     sched_group_barrier as _amd_iglp_sched_group_barrier,
+# )
 from pyhip import div_up
-from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id
+from pyhip.contrib.gluon.utils import read_cycle, read_realtime, get_cu_id, amd_warp_id
 
 __all__ = [
     'gemm_splitk_kernel','get_gemm_splitk'
@@ -282,11 +282,11 @@ def gemm_splitk_kernel(
     enable_debug: gl.constexpr = False,
     num_warps: gl.constexpr = 4,
 ):
-    if enable_debug:
-        _amd_iglp_sched_barrier(0)
-        start = read_realtime()
-        start_cycle = read_cycle()
-        _amd_iglp_sched_barrier(0)
+    # if enable_debug:
+    #   #  _amd_iglp_sched_barrier(0)
+    #     start = read_realtime()
+    #     start_cycle = read_cycle()
+    #   #  _amd_iglp_sched_barrier(0)
     args = Args(BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N, weight_dtype, num_warps, SHUFFLE)
     BLOCK_TILE_SIZE_K: gl.constexpr = args.BLOCK_TILE_SIZE_K
     mem_a_layout: gl.constexpr = args.get_mem_a_layout()
@@ -308,38 +308,39 @@ def gemm_splitk_kernel(
         mem_b_offsets = tile_n * BLOCK_TILE_SIZE_N * K + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_b_layout))[None, :] * (K) + \
                     gl.arange(0, BLOCK_TILE_SIZE_K, layout=gl.SliceLayout(1, mem_b_layout))[:, None]
     if weight_dtype == torch.bfloat16:
-        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
-                                                    instr_shape=[16, 16, 32],
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=3,
+                                                    instr_shape=[16, 16, 16],
                                                     transposed=True,
                                                     tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
                                                     warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=8)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=8)
     else:
-        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=4,
+        # fp8 路径：与 Args.get_mem_a_layout(float8) 及下方 reshape 一致，需 k_width=16 + K=32 指令块
+        c_layout: gl.constexpr = gl.amd.AMDMFMALayout(version=3,
                                                     instr_shape=[16, 16, 32],
                                                     transposed=True,
                                                     tiles_per_warp=[1, BLOCK_TILE_SIZE_M // 16, BLOCK_TILE_SIZE_N // 16],
                                                     warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id() // 2
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + amd_warp_id() // 2
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
     a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
     b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
     acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-    if enable_debug:
-        _amd_iglp_sched_barrier(0)
-        loop_start = read_realtime()
-        loop_start_cycle = read_cycle()
-        _amd_iglp_sched_barrier(0)
+    # if enable_debug:
+    #     # _amd_iglp_sched_barrier(0)
+    #     loop_start = read_realtime()
+    #     loop_start_cycle = read_cycle()
+    #     # _amd_iglp_sched_barrier(0)
     s_vmem_read: gl.constexpr = 0x0020
     s_mfma: gl.constexpr = 0x0008
     s_ds_read: gl.constexpr = 0x0100
     s_ds_write: gl.constexpr = 0x0200
 
     for k_start in gl.static_range(0, K - BLOCK_TILE_SIZE_K, BLOCK_TILE_SIZE_K):
-        _amd_iglp_sched_barrier(0)
+        #_amd_iglp_sched_barrier(0)
         a_offsets = mem_a_offsets + k_start + BLOCK_TILE_SIZE_K
         if SHUFFLE:
             b_offsets = mem_b_offsets + k_start * 16 + BLOCK_TILE_SIZE_K * 16
@@ -368,7 +369,7 @@ def gemm_splitk_kernel(
             b0 = b0.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
             b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
             local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-            local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
+            local_acc = gl.amd.cdna3.mfma(a0_fma, b0_fma, local_acc)
             acc += local_acc * weight_scale
         else:
             a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -378,19 +379,19 @@ def gemm_splitk_kernel(
             else:
                 b = b.reshape(num_warps, 4, 8, BLOCK_TILE_SIZE_N).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
             b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-            acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
+            acc = gl.amd.cdna3.mfma(a_fma, b_fma, acc)
         a = next_a
         b = next_b
         if weight_dtype == torch.float8_e4m3fn:
             weight_scale = next_weight_scale
-        _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
-        _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
+        # _amd_iglp_sched_group_barrier(s_vmem_read, BLOCK_TILE_SIZE_M // 16 + BLOCK_TILE_SIZE_N // 16, 0)
+        # _amd_iglp_sched_group_barrier(s_mfma, BLOCK_TILE_SIZE_M // 16 * BLOCK_TILE_SIZE_N // 16, 0)
 
-    _amd_iglp_sched_barrier(0)
-    if enable_debug:
+    #_amd_iglp_sched_barrier(0)
+    # if enable_debug:
         loop_end = read_realtime()
         loop_end_cycle = read_cycle()
-        _amd_iglp_sched_barrier(0)
+       # _amd_iglp_sched_barrier(0)
     # tail
     if weight_dtype == torch.float8_e4m3fn:
         a0 = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 64)
@@ -401,7 +402,7 @@ def gemm_splitk_kernel(
         b0 = b0.permute(0, 1, 3, 4, 2).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
         b0_fma = gl.convert_layout(b0, b_fma_layout, assert_trivial=True)
         local_acc = gl.zeros((num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_N), dtype=gl.float32, layout=c_layout)
-        local_acc = gl.amd.cdna4.mfma(a0_fma, b0_fma, local_acc)
+        local_acc = gl.amd.cdna3.mfma(a0_fma, b0_fma, local_acc)
         acc += local_acc * weight_scale
     else:
         a = a.reshape(BLOCK_TILE_SIZE_M, num_warps, 4, 8).permute(1, 0, 2, 3).reshape(num_warps, BLOCK_TILE_SIZE_M, BLOCK_TILE_SIZE_K // num_warps)
@@ -411,7 +412,7 @@ def gemm_splitk_kernel(
         else:
             b = b.reshape(num_warps, 4, 8, BLOCK_TILE_SIZE_N).reshape(num_warps, BLOCK_TILE_SIZE_K // num_warps, BLOCK_TILE_SIZE_N)
         b_fma = gl.convert_layout(b, b_fma_layout, assert_trivial=True)
-        acc = gl.amd.cdna4.mfma(a_fma, b_fma, acc)
+        acc = gl.amd.cdna3.mfma(a_fma, b_fma, acc)
 
     if num_warps == 1:
         out_offsets_m = (tile_m * BLOCK_TILE_SIZE_M + gl.arange(0, BLOCK_TILE_SIZE_M, layout=gl.SliceLayout(1, mem_c_layout))) % M
@@ -434,17 +435,17 @@ def gemm_splitk_kernel(
         out_offsets_n = (tile_n * BLOCK_TILE_SIZE_N + gl.arange(0, BLOCK_TILE_SIZE_N, layout=gl.SliceLayout(0, mem_c_layout))) % N
         out_offsets = out_offsets_m[:, None] * N + out_offsets_n[None, :]
         gl.amd.cdna3.buffer_store(gl.convert_layout(acc_r, mem_c_layout, assert_trivial=True), p_output, out_offsets)
-    if enable_debug:
-        _amd_iglp_sched_barrier(0)
-        end = read_realtime()
-        end_cycle = read_cycle()
-        cu_id, se_id, xcc_id, slot_id = get_cu_id()
-        gl.store(p_debug_buf + pid * 9 + 0, start)
-        gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
-        gl.store(p_debug_buf + pid * 9 + 2, loop_start)
-        gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
-        gl.store(p_debug_buf + pid * 9 + 4, loop_end)
-        gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
-        gl.store(p_debug_buf + pid * 9 + 6, end)
-        gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
-        gl.store(p_debug_buf + pid * 9 + 8, (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
+    # if enable_debug:
+    #     #_amd_iglp_sched_barrier(0)
+    #     end = read_realtime()
+    #     end_cycle = read_cycle()
+    #     cu_id, se_id, xcc_id, slot_id = get_cu_id()
+    #     gl.store(p_debug_buf + pid * 9 + 0, start)
+    #     gl.store(p_debug_buf + pid * 9 + 1, start_cycle)
+    #     gl.store(p_debug_buf + pid * 9 + 2, loop_start)
+    #     gl.store(p_debug_buf + pid * 9 + 3, loop_start_cycle)
+    #     gl.store(p_debug_buf + pid * 9 + 4, loop_end)
+    #     gl.store(p_debug_buf + pid * 9 + 5, loop_end_cycle)
+    #     gl.store(p_debug_buf + pid * 9 + 6, end)
+    #     gl.store(p_debug_buf + pid * 9 + 7, end_cycle)
+    #     gl.store(p_debug_buf + pid * 9 + 8, (slot_id & 0xff) | ((cu_id & 0xff) << 8) | ((se_id & 0xff) << 16) | ((xcc_id & 0xff) << 24))
