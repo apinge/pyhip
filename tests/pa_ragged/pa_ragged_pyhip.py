@@ -1,9 +1,6 @@
 """
-通过 `pa_ragged_kernels.cpp` 内 **C++ host 入口** `pa_ragged::launch_bf16_two_kernels` 顺序 launch
-`pa` 与 `pa_reduce`（与 aiter `pa_ragged.cpp.jinja` 中双 `<<<>>>` 一致），不再在 Python 里分两次 `pyhip.module` 调 kernel。
-
-设备代码与 host 由 hipcc **全量**编成共享库 `libpa_ragged_bf16.so`，Python 用 ctypes 调 C ABI 符号 `pyhip_pa_ragged_launch_bf16`
-（薄封装，内部仍为 C++ 实现；避免 pyhip.module 解析 device-only 时无法带 host launch）。
+与 `conv_depthwise.py` 相同：`pyhip.module("pa_ragged_kernels.cpp", ...)` 编译 device-only `.co`，
+在 Python 里顺序 launch `pa` → `pa_reduce`（对齐 aiter `pa_ragged.cpp.jinja` 双 kernel），无需单独 `hipcc -shared` / ctypes。
 
 写死宏与 `/root/workspace/pa/csrc/cpp_itfs/pa/pa_ragged.cpp.jinja` 默认一致：
 `HQ=32, HK=4, S=128, KV_PART_SIZE=256`。
@@ -20,64 +17,20 @@ workspace 布局与 host 参考实现一致：先 max_logits 与 exp_sums 两段
 """
 from __future__ import annotations
 
-import ctypes
 import os
-import subprocess
 from typing import Optional
 
+import pyhip
 import torch
 
 _DIR = os.path.dirname(os.path.abspath(__file__))
 _SRC = os.path.join(_DIR, "pa_ragged_kernels.cpp")
-_PYHIP_CACHE = os.getenv("PYHIP_CACHE_DIR", os.path.expanduser("~/.pyhip"))
-_SO_NAME = "libpa_ragged_bf16.so"
-_SO_PATH = os.path.join(_PYHIP_CACHE, _SO_NAME)
-
-_LIB: Optional[ctypes.CDLL] = None
-_LAUNCH = None
-
-
-def _compile_so_if_needed() -> None:
-    os.makedirs(_PYHIP_CACHE, exist_ok=True)
-    if os.path.isfile(_SO_PATH) and os.path.getmtime(_SO_PATH) >= os.path.getmtime(_SRC):
-        return
-    tmp = _SO_PATH + ".building"
-    cmd = ["hipcc", "-std=c++20", "-fPIC", "-shared", "-O2", "-o", tmp, _SRC]
-    subprocess.check_call(cmd)
-    os.replace(tmp, _SO_PATH)
-
-
-def _load_launch() -> None:
-    global _LIB, _LAUNCH
-    if _LAUNCH is not None:
-        return
-    _compile_so_if_needed()
-    _LIB = ctypes.CDLL(_SO_PATH)
-    fn = _LIB.pyhip_pa_ragged_launch_bf16
-    fn.argtypes = [
-        ctypes.c_void_p,  # stream
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_uint32,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    ]
-    fn.restype = ctypes.c_int32
-    _LAUNCH = fn
-
-
+mod = pyhip.module(_SRC, "-O2")
 HQ = 32
 HK = 4
 HEAD_DIM = 128
 KV_PART_SIZE = 256
+NUM_THREADS = 256
 
 
 def run_pa_ragged_bf16(
@@ -103,6 +56,7 @@ def run_pa_ragged_bf16(
     if num_heads != HQ or head_dim != HEAD_DIM:
         raise ValueError(f"need num_heads={HQ}, head_dim={HEAD_DIM}, got {num_heads}, {head_dim}")
     nstat = num_seqs * num_heads * max_num_partitions
+  #  breakpoint()
     if workspace_f2 is None:
         f2 = torch.empty(2 * nstat, dtype=torch.float32, device=device)
     else:
@@ -127,26 +81,36 @@ def run_pa_ragged_bf16(
 
     if qk_stub is None:
         qk_stub = torch.empty(1, dtype=torch.float32, device=device)
-
-    _load_launch()
-    stream = torch.cuda.current_stream()
-    # PyTorch 2: cuda_stream 为底层 stream 句柄（整数）
-    stream_ptr = ctypes.c_void_p(stream.cuda_stream)
-    err = _LAUNCH(
-        stream_ptr,
-        int(num_seqs) & 0xFFFFFFFF,
-        int(max_num_partitions) & 0xFFFFFFFF,
-        int(q_stride) & 0xFFFFFFFF,
-        ctypes.c_void_p(query.data_ptr()),
-        ctypes.c_void_p(key_cache.data_ptr()),
-        ctypes.c_void_p(value_cache.data_ptr()),
-        ctypes.c_void_p(kv_indptr.data_ptr()),
-        ctypes.c_void_p(kv_page_indices.data_ptr()),
-        ctypes.c_void_p(tmp_out_seg.data_ptr()),
-        ctypes.c_void_p(qk_stub.data_ptr()),
-        ctypes.c_void_p(max_logits_buf.data_ptr()),
-        ctypes.c_void_p(exp_sums_buf.data_ptr()),
-        ctypes.c_void_p(out.data_ptr()),
+    #breakpoint()
+    tmp_out_seg.zero_()
+    max_logits_buf.zero_()
+    exp_sums_buf.zero_()
+    out.zero_()
+   
+  # 256x64 = 16384
+    mod.pa(
+        [num_seqs, HK, max_num_partitions],  # [num_seqs, 4, 64]
+        [NUM_THREADS],
+        query.data_ptr(), # [1, 32, 128] 
+        key_cache.data_ptr(), #  ([16384, 1, 4, 128]
+        value_cache.data_ptr(), # [16384, 1, 4, 128]
+        kv_indptr.data_ptr(), # [2] [    0, 16384]
+        kv_page_indices.data_ptr(), # shape [16384]
+        tmp_out_seg.data_ptr(), # [1, 32, 64, 128] [seq, Q_head, partition, head_dim]
+        qk_stub.data_ptr(), # [1]
+        max_logits_buf.data_ptr(), # torch.Size([2048])  32*64 Q_head, partition
+        exp_sums_buf.data_ptr(), # exp_sums_buf shape: torch.Size([2048]) 32*64
+        int(q_stride) & 0xFFFFFFFF, #  4096 0xFFFFFFFF是32位掩码
     )
-    if err != 0:
-        raise RuntimeError(f"pyhip_pa_ragged_launch_bf16 failed, hipError_t={err}")
+   # print(f"tmp_out_seg shape: {tmp_out_seg.shape} max_logits_buf shape: {max_logits_buf.shape} exp_sums_buf shape: {exp_sums_buf.shape}")
+    mod.pa_reduce(
+        [num_seqs, HQ],  # [num_seqs, HQ]
+        [NUM_THREADS],
+        kv_indptr.data_ptr(),
+        tmp_out_seg.data_ptr(),
+        max_logits_buf.data_ptr(),
+        exp_sums_buf.data_ptr(),
+        out.data_ptr(), # out shape: torch.Size([1, 32, 128])
+        int(max_num_partitions) & 0xFFFFFFFF,
+    )
+    #print(f"out shape: {out.shape}")

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 """
-正确性：仅 pyhip `run_pa_ragged_bf16` 与 Torch golden `allclose`。aiter 只做 cudaPerf 性能对比，不比正确性。
+正确性：仅 pyhip `run_pa_ragged_bf16` 与 Torch golden `allclose`。
 
     ctx_len=8192, num_seqs=1, num_heads=(32,4), head_dim=128, block_size=1, bf16, NHD
 
@@ -332,6 +332,7 @@ def _benchmark_pa_ragged(buf_cases: List[dict], run_count: int, perf_name: str) 
     tflops_res: List[float] = []
     latencies: List[float] = []
     bw_res: List[float] = []
+    assert run_count >1 , "run_count must be greater than 1"
     for _ in range(run_count):
         c = buf_cases[i]
         with cudaPerf(c["flops"], c["rw_bytes"], name=f"{perf_name}[{c['tag']}]") as p:
@@ -352,15 +353,6 @@ def _benchmark_pa_ragged(buf_cases: List[dict], run_count: int, perf_name: str) 
         tflops_res.append(p.tflops())
         latencies.append(p.dt())
         bw_res.append(p.bw())
-    if run_count > 1:
-        avg_tf = sum(tflops_res[1:]) / len(tflops_res[1:])
-        avg_lat_us = sum(latencies[1:]) / len(latencies[1:]) * 1e6
-        avg_bw = sum(bw_res[1:]) / len(bw_res[1:])
-        print(
-            f"{perf_name}: avg (drop 1st) TFLOPS={avg_tf:.3f}, latency_us={avg_lat_us:.3f}, GB/s={avg_bw:.1f}"
-        )
-    elif run_count == 1:
-        print(f"{perf_name}: TFLOPS={tflops_res[0]:.3f}, latency_us={latencies[0]*1e6:.3f}, GB/s={bw_res[0]:.1f}")
 
 
 def _benchmark_aiter_pa_ragged(buf_cases: List[dict], run_count: int, perf_name: str) -> None:
@@ -406,15 +398,11 @@ def _benchmark_aiter_pa_ragged(buf_cases: List[dict], run_count: int, perf_name:
 
 
 def compare_pa_ragged_to_torch() -> int:
-    """返回 0 表示误差在阈值内，1 表示失败。正确性通过后可选 cudaPerf 性能（BUF_COPY 轮换）。"""
-    if not torch.cuda.is_available():
-        print("SKIP: CUDA not available", file=sys.stderr)
-        return 1
 
     # 显式绑定 0 号卡，避免默认 cuda 上下文与后续 aiter 内部 `device="cuda"` 不一致。
     torch.cuda.set_device(0)
     device = "cuda:0"
-    ctx_len = 8192
+    ctx_len = 8192*2
     num_seqs = 1
 
     (
@@ -435,6 +423,7 @@ def compare_pa_ragged_to_torch() -> int:
 
     out = torch.empty_like(query)
     q_stride = int(query.stride(0))
+    
     run_pa_ragged_bf16(
         out,
         query,

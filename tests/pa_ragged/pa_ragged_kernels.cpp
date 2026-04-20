@@ -1,5 +1,5 @@
 /*
- * Standalone bf16 pa + pa_reduce kernels + host launcher for pyhip.module().
+ * bf16 `pa` + `pa_reduce` device kernels for `pyhip.module`（Python 顺序 launch 两 kernel）。
  * Derived from aiter / pyhip paged-attention work; no vLLM/ck_tile fallback.
  * Build-time macros: HQ, HK, S, BLOCK_SIZE, KV_PART_SIZE, SCALE, FAKE_Q, FAKE_K_IDX, OUTPUT_QK
  */
@@ -225,7 +225,7 @@ constexpr void compile_time_loop(F&& f) {
                           std::make_index_sequence<N>{});
 }
 
-#define KV_PART_SIZE_WARP (KV_MIN_PART_SIZE / 4)
+#define KV_PART_SIZE_WARP (KV_MIN_PART_SIZE / 4) // 256个线程为一个workgroup 每个wavefront分到的大小
 
 struct share_buf_t {
     __bf16* buf;
@@ -266,31 +266,32 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
             float* sum_out,         // [B, HQ, PART, 1]
             uint q_stride) {
     // wg: B, HK, kv_part
-    uint b = blockIdx.x;
-    uint hk = blockIdx.y;
-    uint hq = hk * (HQ / HK);
-    uint kv_part = blockIdx.z;
+    uint b = blockIdx.x;  // batch 
+    uint hk = blockIdx.y; // kv_head 注意这是对整个workgroup而言
+    uint hq = hk * (HQ / HK); // 第几个q 对整个workgroup而言
+    uint kv_part = blockIdx.z; // partition维度第几个？ 64里的第几个
     uint lane_id = threadIdx.x % 64;
     uint warp_id = threadIdx.x / 64;
-    const uint q_b_stride = q_stride;
-    const uint q_h_stride = S;
-    query += b * q_b_stride + hq * q_h_stride;
-    key_cache += hk * S;
-    value_cache += hk * S;
-    uint last_kv_idx = kv_indptr[b + 1];
-    uint kv_len = last_kv_idx - kv_indptr[b];
+    const uint q_b_stride = q_stride; // tp_q_head_num* qk_head_dim = tp分割的头*head_dim 
+    const uint q_h_stride = S; // head_dim
+    query += b * q_b_stride + hq * q_h_stride; // 第几个batch的第几个head的意思
+    key_cache += hk * S; // 大致意思是对着第几个hk ？
+    value_cache += hk * S; // 大致意思是对着第几个hk ？
+    uint last_kv_idx = kv_indptr[b + 1]; // 这里看出kv_indptr是针对 batch 而言
+    uint kv_len = last_kv_idx - kv_indptr[b]; // 当前batch 的sequence len 按 KV_PART_SIZE 分成多份 当前thread是第kv_part个
     if (kv_part * KV_PART_SIZE >= kv_len) return;
     uint kv_len_start = std::min(kv_part * KV_PART_SIZE + warp_id * KV_PART_SIZE_WARP, kv_len);
     uint kv_len_end = std::min(kv_part * KV_PART_SIZE + KV_PART_SIZE, kv_len);
-    kv_page_indices += kv_indptr[b];
-    out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S;
-    max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
-    sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1;
+    kv_page_indices += kv_indptr[b]; // block_size=1 所以这个就是每个token 对应的 “物理 KV block”的映射表”
+    // 这个？？？怎么回事
+    out_seg += b * HQ * gridDim.z * S + hq * gridDim.z * S + kv_part * S; //[batch, Q_head, partition, head_dim]
+    max_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1; // [Q_head* partition]
+    sum_out += b * HQ * gridDim.z * 1 + hq * gridDim.z * 1 + kv_part * 1; // [Q_head* partition]
 
     // stage1(q*k): [16, 32]x[64, 32]'
     BufferResource q_buf(query, (HQ / HK) * S * sizeof(__bf16));
     static_assert(HQ / HK <= 16, "use mfma16 requires M <= 16");
-    bfloat16x8 q_cur[S / 32];
+    bfloat16x8 q_cur[S / 32]; // 这里的意思是 4个 bfloat16x8 一组
     // key load layout: 4rows x 16 cols
     uint key_load_col_id = lane_id % 16; // 0 ~ 15
     uint key_load_row_id = lane_id / 16; // 0 ~ 3
@@ -636,64 +637,4 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
         tmp_val[1] = cur_val[1];
         ((bfloat16x2*)out)[lane_id] = tmp_val;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Host：一次入口顺序 launch pa → pa_reduce（对齐 aiter pa_ragged.cpp.jinja 中双 kernel 流程）。
-// 本文件由 hipcc 全量编译为共享库供 Python ctypes 调用；不再经 pyhip.module 按 kernel 分别 launch。
-// ---------------------------------------------------------------------------
-#include <hip/hip_runtime_api.h>
-
-namespace pa_ragged {
-
-hipError_t launch_bf16_two_kernels(
-    hipStream_t stream,
-    unsigned int num_seqs,
-    unsigned int max_num_partitions,
-    unsigned int q_stride,
-    __bf16* query,
-    __bf16* key_cache,
-    __bf16* value_cache,
-    uint* kv_indptr,
-    uint* kv_page_indices,
-    __bf16* tmp_out_seg,
-    float* qk_ptr,
-    float* max_logits,
-    float* exp_sums,
-    __bf16* out) {
-    dim3 grid_pa(num_seqs, HK, max_num_partitions);
-    dim3 grid_r(num_seqs, HQ);
-    dim3 block(NUM_THREADS);
-    hipLaunchKernelGGL(pa, grid_pa, block, 0, stream, query, key_cache, value_cache, kv_indptr,
-                         kv_page_indices, tmp_out_seg, qk_ptr, max_logits, exp_sums, q_stride);
-    hipLaunchKernelGGL(pa_reduce, grid_r, block, 0, stream, kv_indptr, tmp_out_seg, max_logits,
-                         exp_sums, out, max_num_partitions);
-    return hipGetLastError();
-}
-
-} // namespace pa_ragged
-
-// Python ctypes 稳定入口（避免依赖 C++ 修饰名）；实现仍委托给 pa_ragged::launch_bf16_two_kernels。
-extern "C" hipError_t pyhip_pa_ragged_launch_bf16(
-    void* stream,
-    unsigned int num_seqs,
-    unsigned int max_num_partitions,
-    unsigned int q_stride,
-    void* query,
-    void* key_cache,
-    void* value_cache,
-    void* kv_indptr,
-    void* kv_page_indices,
-    void* tmp_out_seg,
-    void* qk_ptr,
-    void* max_logits,
-    void* exp_sums,
-    void* out) {
-    return pa_ragged::launch_bf16_two_kernels(
-        reinterpret_cast<hipStream_t>(stream), num_seqs, max_num_partitions, q_stride,
-        reinterpret_cast<__bf16*>(query), reinterpret_cast<__bf16*>(key_cache),
-        reinterpret_cast<__bf16*>(value_cache), reinterpret_cast<uint*>(kv_indptr),
-        reinterpret_cast<uint*>(kv_page_indices), reinterpret_cast<__bf16*>(tmp_out_seg),
-        reinterpret_cast<float*>(qk_ptr), reinterpret_cast<float*>(max_logits),
-        reinterpret_cast<float*>(exp_sums), reinterpret_cast<__bf16*>(out));
 }
