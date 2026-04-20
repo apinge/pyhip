@@ -307,7 +307,7 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
     uint idx_global = lane_id + cur_kv_len_start;
     idx_lds[lane_id] = (idx_global < kv_len_end) ? kv_page_indices[idx_global] : 0;
     // 这条是原始用法先保留 
-    // 改api在rocm7.2 不生效 hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll 
+    // 似乎该api在rocm7.2 不生效 hipcc -O2 -c -std=c++20 --offload-arch=gfx942 -S -emit-llvm pa.cpp -o k72.ll 
     // 检查到 llvm ir中无法生成 @llvm.amdgcn.raw.buffer.load.lds
     //llvm_amdgcn_raw_buffer_load_lds(idx_buf.descriptor, (as3_uint32_ptr)idx_lds, 4, (lane_id + cur_kv_len_start) * sizeof(uint), 0, 0, 0);
     __builtin_amdgcn_sched_barrier(0);
