@@ -183,6 +183,8 @@ __device__ void s_waitcnt_lgkmcnt() {
 #ifndef HQ
 #define HQ 32 
 #define HK 4
+// #define HQ 12
+// #define HK 2
 #define S 128 
 #define BLOCK_SIZE 1
 #define SCALE 1.0 
@@ -491,7 +493,16 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         *share_buf.get_sum_buf(fma_row_id, warp_id) = cur_sum;
     }
     __syncthreads();
-    // each wave will process HQ / HK / 4 tokens of output, each
+    // 开始写回
+    // each wave processes up to ceil(HQ/HK, 4) query tokens (TOKENS_PER_WARP); must match the write-back loop below
+    constexpr uint M = HQ / HK; // gqa ratio
+    constexpr uint TOKENS_PER_WARP = (M + 3) / 4; // ceil_div(M, 4) warp 负责的 query token 数目
+
+    float maxs[4 * TOKENS_PER_WARP], sums[4 * TOKENS_PER_WARP];
+    float real_max[TOKENS_PER_WARP], real_sum[TOKENS_PER_WARP];
+
+    /*
+    // old fixed split (requires HQ/HK divisible by 4):
     float maxs[HQ / HK], sums[HQ / HK];
     float real_max[HQ / HK / 4], real_sum[HQ / HK / 4];
     for (uint i = 0; i < HQ / HK / 4; i++) {
@@ -503,15 +514,37 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         real_max[i] = fmaxf(
             fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
             fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
-
         sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
         sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
         sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
         sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
-        real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
-                      sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
-                      sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
+        real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) +
+                      sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) +
+                      sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) +
                       sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
+    }
+    */
+
+    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
+        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
+        if (m_token_id < M) {
+            maxs[4 * i + 0] = *share_buf.get_max_buf(m_token_id, 0);
+            maxs[4 * i + 1] = *share_buf.get_max_buf(m_token_id, 1);
+            maxs[4 * i + 2] = *share_buf.get_max_buf(m_token_id, 2);
+            maxs[4 * i + 3] = *share_buf.get_max_buf(m_token_id, 3);
+            real_max[i] = fmaxf(
+                fmaxf(maxs[4 * i + 0], maxs[4 * i + 1]),
+                fmaxf(maxs[4 * i + 2], maxs[4 * i + 3]));
+
+            sums[4 * i + 0] = *share_buf.get_sum_buf(m_token_id, 0);
+            sums[4 * i + 1] = *share_buf.get_sum_buf(m_token_id, 1);
+            sums[4 * i + 2] = *share_buf.get_sum_buf(m_token_id, 2);
+            sums[4 * i + 3] = *share_buf.get_sum_buf(m_token_id, 3);
+            real_sum[i] = sums[4 * i + 0] * __expf(maxs[4 * i + 0] - real_max[i]) + 
+                          sums[4 * i + 1] * __expf(maxs[4 * i + 1] - real_max[i]) + 
+                          sums[4 * i + 2] * __expf(maxs[4 * i + 2] - real_max[i]) + 
+                          sums[4 * i + 3] * __expf(maxs[4 * i + 3] - real_max[i]);
+        }
     }
 
     bfloat16x4 vout_low[S / 64 * 4];
@@ -531,9 +564,9 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa(
         ((bfloat16x4*)(shared_out + k * 64))[(fma_col_id * 4 + 3) ^ fma_row_id] = vout_low[k * 4 + 3];
     }
     __syncthreads();
-    for (uint i = 0; i < HQ / HK / 4; i++) {
-        uint m_token_id = HQ / HK / 4 * warp_id + i;
-        if (m_token_id < HQ / HK) {
+    for (uint i = 0; i < TOKENS_PER_WARP; i++) {
+        uint m_token_id = TOKENS_PER_WARP * warp_id + i;
+        if (m_token_id < M) {
             bfloat16x2 tmp = ((bfloat16x2*)(share_buf.get_out_buf(0) + m_token_id * S))[(m_token_id ^ (lane_id / 2)) * 2 + (lane_id & 1)];
             float32x2 out_v;
             out_v[0] = tmp[0];
