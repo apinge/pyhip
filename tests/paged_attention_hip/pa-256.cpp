@@ -642,25 +642,22 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
         real_max = fmaxf(real_max, __shfl_xor(real_max, mask));
     }
 
-    float32x2 cur_lo = {};
-    float32x2 cur_hi = {};
+    float32x4 cur = {};
     float warp_sum = 0;
     for (uint i = warp_id; i < part_num; i += 4) {
         auto cur_max = max_out[i];
         auto cur_out_seg = out_seg + i * S;
-        auto v_lo = ((bfloat16x2*)cur_out_seg)[lane_id];
-        auto v_hi = ((bfloat16x2*)(cur_out_seg + 128))[lane_id];
-        float32x2 tmp_lo;
-        tmp_lo[0] = (float)v_lo[0];
-        tmp_lo[1] = (float)v_lo[1];
-        float32x2 tmp_hi;
-        tmp_hi[0] = (float)v_hi[0];
-        tmp_hi[1] = (float)v_hi[1];
+        auto v = ((bfloat16x4*)cur_out_seg)[lane_id];
+        float32x4 tmp;
+        tmp[0] = (float)v[0];
+        tmp[1] = (float)v[1];
+        tmp[2] = (float)v[2];
+        tmp[3] = (float)v[3];
         const float w = sum_out[i] * __expf(cur_max - real_max);
-        cur_lo[0] += tmp_lo[0] * w;
-        cur_lo[1] += tmp_lo[1] * w;
-        cur_hi[0] += tmp_hi[0] * w;
-        cur_hi[1] += tmp_hi[1] * w;
+        cur[0] += tmp[0] * w;
+        cur[1] += tmp[1] * w;
+        cur[2] += tmp[2] * w;
+        cur[3] += tmp[3] * w;
         warp_sum += sum_out[i] * __expf(cur_max - real_max);
     }
 
@@ -670,24 +667,20 @@ __global__ void __launch_bounds__(NUM_THREADS, 2) pa_reduce(
         sum_lds[warp_id] = warp_sum;
     }
     if (warp_id != 0) {
-        *(float32x2*)(&out_lds[warp_id * S + lane_id * 4 + 0]) = cur_lo;
-        *(float32x2*)(&out_lds[warp_id * S + lane_id * 4 + 2]) = cur_hi;
+        *(float32x4*)(&out_lds[warp_id * S + lane_id * 4 + 0]) = cur;
     }
     __syncthreads();
     if (warp_id == 0) {
         warp_sum += sum_lds[1] + sum_lds[2] + sum_lds[3];
         for (int wi = 1; wi < 4; wi++) {
-            cur_lo += *(float32x2*)(&out_lds[wi * S + lane_id * 4 + 0]);
-            cur_hi += *(float32x2*)(&out_lds[wi * S + lane_id * 4 + 2]);
+            cur += *(float32x4*)(&out_lds[wi * S + lane_id * 4 + 0]);
         }
         const float inv_sum_scale = 1.f / (warp_sum + 1e-6f);
-        bfloat16x2 o_lo;
-        o_lo[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur_lo[0] * inv_sum_scale) >> 16));
-        o_lo[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur_lo[1] * inv_sum_scale) >> 16));
-        bfloat16x2 o_hi;
-        o_hi[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur_hi[0] * inv_sum_scale) >> 16));
-        o_hi[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur_hi[1] * inv_sum_scale) >> 16));
-        ((bfloat16x2*)out)[lane_id] = o_lo;
-        ((bfloat16x2*)(out + 128))[lane_id] = o_hi;
+        bfloat16x4 o;
+        o[0] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[0] * inv_sum_scale) >> 16));
+        o[1] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[1] * inv_sum_scale) >> 16));
+        o[2] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[2] * inv_sum_scale) >> 16));
+        o[3] = std::bit_cast<__bf16>((ushort)(std::bit_cast<uint>(cur[3] * inv_sum_scale) >> 16));
+        ((bfloat16x4*)out)[lane_id] = o;
     }
 }
