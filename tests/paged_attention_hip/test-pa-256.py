@@ -10,7 +10,7 @@ B = 1
 HQ = 12
 HK = 2
 S = 256
-KV_LEN = 45694
+KV_LEN = 8000 # 我们的实际例子是8k 16K为主  45694是长上下文情况 保留
 #KV_LEN = 512
 DT = torch.bfloat16
 BLOCK_SIZE = 1
@@ -20,7 +20,7 @@ FAKE_K_IDX = 0
 OUTPUT_QK = 0
 BUF_COPY = 1
 BUF_COPY = 32
-KV_PART_SIZE = 256 * 4
+KV_PART_SIZE = 256 # 1024
 USE_REDUCE_JIT = False
 
 ######################################################################
