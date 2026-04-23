@@ -20,7 +20,7 @@ FAKE_K_IDX = 0
 OUTPUT_QK = 0
 BUF_COPY = 1
 BUF_COPY = 32
-KV_PART_SIZE = 256 # 1024
+KV_PART_SIZE = 512  # 256 or 512 or 1024
 USE_REDUCE_JIT = False
 
 ######################################################################
@@ -316,8 +316,9 @@ else:
     pa_reduce_jit([B, HQ], [256], 
                 kv_indptrs[-1].data_ptr(), my_out_seg.data_ptr(), my_max.data_ptr(), my_sum.data_ptr(), my_out.data_ptr(), div_up(KV_LEN, KV_PART_SIZE),
                 checks1.data_ptr())
-assert torch.allclose(out, my_out, rtol=0.06, atol=0.03), "pa acc is wrong compare with aiter"
-print('pa acc ok compare with aiter') # 开发时注掉这个
+# 发现 KV_LEN很长时 aiter和pa的结果对不上 但是pa和torch结果能对上 先注掉和aiter的比较
+#assert torch.allclose(out, my_out, rtol=0.06, atol=0.03), "pa acc is wrong compare with aiter"
+#print('pa acc ok compare with aiter') # 开发时注掉这个
 
 # check q*k
 if 1:
@@ -339,8 +340,9 @@ if 1:
     idx = torch.where(torch.abs(ref_out - cur_out) > 0.05)
     if len(idx[0]):
         print(f'idx = {idx}\nref_out={ref_out[idx]}\ncur={cur_out[idx]}')
-    # bf16 MFMA 与 PyTorch 参考在 S=256 下常见 ~0.02 量级绝对误差
-    assert torch.allclose(ref_out, cur_out, rtol=0.06, atol=0.03), "pa out is wrong"
+    # 维持原版的 check方式 不要动
+    assert torch.allclose(ref_out, cur_out, rtol=0.01, atol=0.01), "pa out is wrong"
+    print('pa compared with torch ok')
 
 i = 0
 for _ in range(10):
