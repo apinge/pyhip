@@ -106,24 +106,28 @@ union BufferResource {
 // https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html#OutputOperands
 
 template<typename T, int imm_offset=0>
+    requires (sizeof(T) == sizeof(int32x4_t))
 __device__ T ds_read_b128(T* base, int index) {
     T v;
-    static_assert(sizeof(T) == sizeof(int32x4_t));
+    //static_assert(sizeof(T) == sizeof(int32x4_t));
     as3_uint32_ptr vaddr = (as3_uint32_ptr)(base + index);
     asm volatile("ds_read_b128 %[vdst], %[vaddr] offset:%[offset]"
                 : [vdst]"=v"((int32x4_t&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset));
+                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
+                : "memory");
     return v;
 }
 
 template<typename T, int imm_offset=0>
+    requires (sizeof(T) == sizeof(int32_t))
 __device__ T ds_read_b32(T* base, int index) {
     T v;
-    static_assert(sizeof(T) == sizeof(int32_t));
+    //static_assert(sizeof(T) == sizeof(int32_t));
     as3_uint32_ptr vaddr = (as3_uint32_ptr)(base + index);
     asm volatile("ds_read_b32 %[vdst], %[vaddr] offset:%[offset]"
                 : [vdst]"=v"((int32_t&)(v))
-                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset));
+                : [vaddr]"v"(vaddr),[offset]"i"(imm_offset)
+                : "memory");
     return v;
 }
 
@@ -137,14 +141,16 @@ __device__ T buffer_load_dwordx4(BufferResource& buffer, int soffset, int voffse
     T v;
     asm volatile("buffer_load_dwordx4 %[vdst], %[vaddr], %[srsrc], %[soffset] offen\n"
         :[vdst]"=v"(v)
-        :[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset));
+        :[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset)
+        : "memory");
     return v;
 }
 
 template<int imm_off>
 __device__ void buffer_load_dword_lds(BufferResource& buffer, int soffset, int voffset) {
     asm volatile("buffer_load_dword %[vaddr], %[srsrc], %[soffset] offen offset:%[ioffset] lds\n"
-        ::[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset), [ioffset]"i"(imm_off));
+        ::[vaddr]"v"(voffset), [srsrc]"s"(buffer.descriptor), [soffset]"s"(soffset), [ioffset]"i"(imm_off)
+        : "memory");
 }
 
 template<uint16_t cnt>
@@ -257,6 +263,7 @@ __global__ __launch_bounds__(256, 1) void test(int* A, int K, int i0, int* indic
     //#pragma nounroll
     for(int i = 0; i < 64*1024; i += 64) {
         dc += get_cycles([&](){
+            // 这里的256 来自64lane X 4 (dword)
             buffer_load_dword_lds<0>(buff, soffset, voffset);
             buffer_load_dword_lds<1*256>(buff, soffset, voffset);
             buffer_load_dword_lds<2*256>(buff, soffset, voffset);
