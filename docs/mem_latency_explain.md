@@ -161,3 +161,6 @@ llvm_amdgcn_raw_buffer_load_lds(int32x4_t rsrc,
                                 int offset,  // does not change (0); instruction offset
                                 int aux) __asm("llvm.amdgcn.raw.buffer.load.lds"); // cache coherency
 ```
+
+# buffer_load_dword_lds
+[踩坑AMD之异步拷贝](https://zhuanlan.zhihu.com/p/6452256379)
