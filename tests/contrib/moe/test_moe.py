@@ -706,6 +706,7 @@ def run_acc_test(TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP=8):
     test_acc_mxn_splitk_2s_fp8(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=True)
     test_acc_mxn_splitk_2s_fp8(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, fp8_ptpc=False)
     test_acc_mxn_splitk_2s_fp4(batch=get_batch_list('mxn_splitk_2s'), prec=[get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+    
 
 def show_perf(perflist):
     print('\nsummary:')
@@ -713,6 +714,8 @@ def show_perf(perflist):
         for kernel, vals in perf.items():
             for prec, vals_ in vals.items():
                 for b, data in vals_.items():
+                    if data is None:
+                        continue
                     print(f'{kernel}[{prec:<4} B={b:<4}]: {data["latency"]:5.0f} us, {data["bw"]:6.1f} GB/s, {data["flops"]:4.1f} tflops')
 
 @pytest.mark.parametrize("batch", [[1, 2, 4, 8, 12, 16, 32, 64]])
@@ -742,9 +745,35 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
     # perf.append(entry_common('mxn_splitk_1s', batch=batch, prec=[torch.bfloat16], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # perf.append(entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP))
     # TILE_M/N is configurable
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, TOPK=10, E=512, INTER_SIZE=INTER_SIZE, TP=TP))
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512, TP=TP, fp8_ptpc=True))
-    perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512,  TP=TP, fp8_ptpc=False))
+    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[torch.bfloat16, get_fp4type_if_valid()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, TOPK=10, E=512, INTER_SIZE=INTER_SIZE, TP=TP))
+    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512, TP=TP, fp8_ptpc=True))
+    # perf.append(entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TOPK=10, E=512,  TP=TP, fp8_ptpc=False))
+    perf.append(entry_common(
+        "mxn_splitk_2s",
+        batch=batch,
+        prec=[get_fp8type()],
+        TILE_M=TILE_M,
+        TILE_N=TILE_N,
+        HIDDEN_SIZE=HIDDEN_SIZE,
+        INTER_SIZE=INTER_SIZE,
+        TP=TP,
+        fp8_ptpc=False,
+        TOPK=8,
+        E=384,
+    ))
+    perf.append(entry_common(
+        "aiter",
+        batch=batch,
+        prec=[get_fp8type()],
+        TILE_M=TILE_M,
+        TILE_N=TILE_N,
+        HIDDEN_SIZE=HIDDEN_SIZE,
+        INTER_SIZE=INTER_SIZE,
+        TP=TP,
+        fp8_ptpc=False,
+        TOPK=8,
+        E=384,
+    ))
     show_perf(perf)
     del perf
     torch.cuda.empty_cache()
@@ -753,11 +782,12 @@ def test_perf(batch, TILE_M=16, TILE_N=64, HIDDEN_SIZE=4096, INTER_SIZE=1024, TP
 if __name__ == '__main__':
     TILE_M = 16
     TILE_N = 64
-    HIDDEN_SIZE = 4096
-    INTER_SIZE = 1024
+    # HIDDEN_SIZE = 4096
+    INTER_SIZE = 2048
     TP = 8
 
     init_env()
+    HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK =6144, 2048//8, 384, 8
     # entry_common('mxn_splitk_2s', batch=batch, prec=[get_fp8type()], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0, fp8_ptpc=False)
     #entry_common('mxn_2s', batch=batch, prec=[torch.bfloat16], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
     #entry_common('mxn_2s', batch=batch, prec=[torch.float4_e2m1fn_x2], TILE_M=128, TILE_N=128, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, run_count=0)
@@ -766,7 +796,7 @@ if __name__ == '__main__':
     #with torchPerf():
     #    entry_common('aiter', batch, prec=[get_fp4type_if_valid()], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP, TILE_M=TILE_M, TILE_N=TILE_N)
     if 1:
-        run_acc_test(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        #test_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        test_small_batch_perf(batch=[1, 2, 4, 8, 12, 16, 32, 64], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
-        test_perf(batch=[16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        #run_acc_test(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        #est_acc(TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        #test_small_batch_perf(batch=[1, 2, 4, 8, 12, 16, 32, 64], HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
+        test_perf(batch=[1, 2, 4, 8, 12, 16, 32], TILE_M=TILE_M, TILE_N=TILE_N, HIDDEN_SIZE=HIDDEN_SIZE, INTER_SIZE=INTER_SIZE, TP=TP)
