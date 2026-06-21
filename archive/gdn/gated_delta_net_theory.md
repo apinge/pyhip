@@ -53,7 +53,7 @@ $$
 
 $$
 \begin{equation}
-S_t = \sum_{i=1}^t v_i k_i^\top
+S_t = \sum_{i=1}^t v_i k_i^\top\in \mathbb{R}^{d_v \times d_k}
 \end{equation}
 $$
 
@@ -61,12 +61,13 @@ $$
 
 $$
 \begin{equation}
-o_t = S_t q_t
+o_t = S_t q_t \in \mathbb{R}^{d_v}
 \end{equation}
 $$
 
 以上就是linear attention的简化形式
-这里似乎标准attention里的softmax被扔掉了, linear attention额外引入了 kernel feature map 起到了相同的作用，有兴趣的话可以参考论文[Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/abs/2006.16236)，这里不多赘述。
+
+这个不属于严格的推导 只属于理解性的解释，有兴趣的话可以参考论文[Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention](https://arxiv.org/abs/2006.16236)，这里不多赘述。
 
 ## Gated Delta Net
 
