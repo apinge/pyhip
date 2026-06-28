@@ -6,15 +6,15 @@ import flydsl.expr as fx
 from flydsl.utils.env import DebugEnvManager
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, scf, arith
-from onnx_ir import val
+#from onnx_ir import val
 import torch
 
 def get_tv_layout(inverse_tv_layout, num_threads):
     tv_cnt = fx.cosize(inverse_tv_layout).get_static_leaf_int
     assert tv_cnt % num_threads == 0, f"Total tile size {tv_cnt} must be divisible by number of threads {num_threads}"
     num_values = tv_cnt // num_threads
-    M = fx.size(inverse_tv_layout[0]).get_static_leaf_int
-    N = fx.size(inverse_tv_layout[1]).get_static_leaf_int
+    M = fx.size(inverse_tv_layout.shape[0]).get_static_leaf_int
+    N = fx.size(inverse_tv_layout.shape[1]).get_static_leaf_int
     tv_layout = fx.composition(fx.right_inverse(inverse_tv_layout),
                                fx.make_layout((num_threads, num_values), (1, num_threads)))
     def show(self):
@@ -93,13 +93,21 @@ def recurisve_apply(atom_op, *tensors, idx=None):
             else:
                 atom_op(*tensors)
         else:
-            idx = recurisve_apply(atom_op, *[fx.get_(t,0) for t in tensors], idx=idx)
+            shape0 = tensors[0].layout.shape
+            stride0 = tensors[0].layout.stride
+            depth = shape0.depth
+            shapes = tuple(shape0[i] for i in range(depth))
+            strides = tuple(stride0[i] for i in range(depth))
+            tensors = [fx.Tensor(fx.make_view(fx.get_iter(t),
+                        fx.make_layout(shapes, strides))) for t in tensors]
+            return recurisve_apply(atom_op, *tensors, idx=idx)
     else:
-        tensors = [fx.group(t, 1, -1) for t in tensors]
-        size = fx.size(tensors[0].layout[1])
+        rank = tensors[0].layout.rank
+        size = fx.size(tensors[0].layout.shape[rank - 1])
         assert size.is_static, f"Expected static size, got {size}"
+        nones = (None,) * (rank - 1)
         for i in fx.range_constexpr(size.get_static_leaf_int):
-            idx = recurisve_apply(atom_op, *[t[None, i] for t in tensors], idx=idx)
+            idx = recurisve_apply(atom_op, *[t[nones + (i,)] for t in tensors], idx=idx)
     return idx
 
 def test_copy():

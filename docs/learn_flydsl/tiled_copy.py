@@ -122,7 +122,7 @@ def test_tiled_copy_basic(M, N, tileM, tileN, num_waves):
             block=(num_threads, 1, 1), stream=stream
         )
 
-    _, stream = pyhip.set_device()
+    stream=torch.cuda.Stream()
     A = torch.randn(M, N, dtype=torch.float32, device="cuda")
     B = torch.zeros(M, N, dtype=torch.float32, device="cuda")
     test(A, B, False, stream)
@@ -283,7 +283,7 @@ def test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
             block=(num_threads, 1, 1), stream=stream
         )
 
-    _, stream = pyhip.set_device()
+    stream=torch.cuda.Stream()
     A = torch.randn(M, N, dtype=torch.float32, device="cuda")
     B = torch.zeros(M, N, dtype=torch.float32, device="cuda")
     sorted_row_idx = torch.randint(low=0, high=M, size=(M,), dtype=torch.int32, device="cuda")
