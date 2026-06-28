@@ -216,11 +216,14 @@ def run_perftest(kernel, *args, **kwargs):
         else:
             num_copies = num_warmup + num_iters
 
+    def _copy_arg(x):
+        return x.clone() if isinstance(x, torch.Tensor) else x
+
     args_copies = []
     kwarg_copies = []
     for _ in range(num_copies):
-        args_copies.append(copy.deepcopy(args))
-        kwarg_copies.append(copy.deepcopy(kwargs))
+        args_copies.append(tuple(_copy_arg(a) for a in args))
+        kwarg_copies.append({k: _copy_arg(v) for k, v in kwargs.items()})
 
     for i in range(num_warmup + num_iters):
         with perf:

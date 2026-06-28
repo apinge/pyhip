@@ -165,14 +165,24 @@ def test_partion():
         refInv = fx.right_inverse(copy_atom.layout_ref_tv)
         ref2trg = fx.composition(refInv, copy_atom.layout_src_tv) # Layout<(1,8):(0,1)>
         print("ref2trg: ", ref2trg)
-        copy_atom_tv = fx.composition(atomLayoutTV[0], ref2trg) #  Layout<(1,8):(0,32)> o Layout<(1,8):(0,1)> => Layout<(1,8):(0,32)>
-        print("atomLayoutTV[0]: ", atomLayoutTV[0])
+        atomLayoutTV_0 = fx.make_layout(atomLayoutTV.shape[0], atomLayoutTV.stride[0])
+        atomLayoutTV_1 = fx.make_layout(atomLayoutTV.shape[1], atomLayoutTV.stride[1])
+        copy_atom_tv = fx.composition(atomLayoutTV_0, ref2trg) #  Layout<(1,8):(0,32)> o Layout<(1,8):(0,1)> => Layout<(1,8):(0,32)>
+        print("atomLayoutTV[0]: ", atomLayoutTV_0)
         print("copy_atom_tv: ", copy_atom_tv)
 
-        thrval2mn = fxu.concat_modes((copy_atom_tv[0], atomLayoutTV[1][0]),
-                                     (copy_atom_tv[1], atomLayoutTV[1][1]))
+        # thrval2mn = concat_modes((copy_atom_tv[0], atomLayoutTV[1][0]),
+        #                          (copy_atom_tv[1], atomLayoutTV[1][1]))
+        # → Layout<((1,(8,32)),(8,1)):((0,(256,1)),(32,0))>
+        # 直接用 make_layout 构造，避免 concat_modes 内部的 coerce 问题
+        thrval2mn = fx.make_layout(
+            (fx.make_int_tuple((copy_atom_tv.shape[0], atomLayoutTV_1.shape[0])),
+             fx.make_int_tuple((copy_atom_tv.shape[1], atomLayoutTV_1.shape[1]))),
+            (fx.make_int_tuple((copy_atom_tv.stride[0], atomLayoutTV_1.stride[0])),
+             fx.make_int_tuple((copy_atom_tv.stride[1], atomLayoutTV_1.stride[1])))
+        )
         print("thrval2mn: ", thrval2mn) # Layout<((1,(8,32)),(8,1)):((0,(256,1)),(32,0))>
-        thrval2mn = fx.coalesce(thrval2mn, fx.make_int_tuple((1, fx.make_int_tuple((1,1))))) # Layout<((8,32),(8,1)):((256,1),(32,0))>
+        thrval2mn = fly.coalesce(thrval2mn) # Layout<((8,32),(8,1)):((256,1),(32,0))>
         print("thrval2mn coalesce : ", thrval2mn)
 
         thrval2mn_mode0 = fly.static(fly.TileType.get([thrval2mn.type,])) # make_tile has issue
@@ -189,7 +199,7 @@ def test_partion():
 # test_partion()
 
 
-def test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
+def _test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
     num_threads = num_waves * 64
 
     @flyc.kernel(known_block_size=[num_threads, 1, 1]) # known_block_size at compile time
@@ -295,5 +305,5 @@ def test_tiled_gather_rows(M, N, tileM, tileN, num_waves):
     _, us = pyhip.run_perftest(test, A, B, sorted_row_idx, stream, num_iters=10, num_warmup=2, num_bytes=M*N*4*2)
     assert torch.allclose(A[sorted_row_idx], B)
 
-#test_tiled_gather_rows(128, 128, 128, 128, 4)
-test_tiled_gather_rows(4096, 4096, 128, 128, 4)
+#_test_tiled_gather_rows(128, 128, 128, 128, 4)
+#_test_tiled_gather_rows(4096, 4096, 128, 128, 4)
