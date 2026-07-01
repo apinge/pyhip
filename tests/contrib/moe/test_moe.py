@@ -346,7 +346,7 @@ class TestCase:
                 #                 gemm1_out.data_ptr(), w2.data_ptr(), cur_out.data_ptr(), sorted_ids.data_ptr(), sorted_weights.data_ptr(), sorted_expert_ids.data_ptr(), num_valid_ids.data_ptr(), w2_scale.data_ptr() if w2_scale is not None else 0, B, N2, K2, TOPK)
                 num_CU = torch.cuda.get_device_properties().multi_processor_count
                 BLOCK_N = 1024
-                if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU and 32 >= B >= 16:
+                if (w1.dtype == torch.float8_e4m3fn or w1.dtype == torch.float8_e4m3fnuz) and fp8_ptpc and N2 // BLOCK_N * grid >= num_CU and 256 >= B >= 16:
                     BLOCK_TILE_SIZE_M = 16
                     BLOCK_TILE_SIZE_N = 16
                     assert N2 % BLOCK_N == 0
@@ -830,18 +830,18 @@ def test_acc(test):
     #entry_common('mxn_2s', batch=[8192], test_fp8=False, TILE_M=128, TILE_N=128, run_count=0)
     #assert 0,"========================"
 
-    batch = list(range(2, 64))
+    batch = list(range(2, 256))
     # fix TILE_M=16, TILE_N=32
-    test.entry_b1(run_count=0, prec=[prec_bf16, prec_fp8_ptpc])           # batch 1
+    #test.entry_b1(run_count=0, prec=[prec_bf16, prec_fp8_ptpc])           # batch 1
     test.entry_common('16x32_2s_b', batch=batch, prec=[prec_bf16, prec_fp8_ptpc])
-    batch += list(range(128, 256))
-    batch += [i * 256 for i in range(1, 4)]
-    batch += [i * 2048 for i in range(1, 5)]
-    batch += list(range(2048 * 3, 2048 * 3 + 256))
-    test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_bf16, prec_mxfp4])
-    # TILE_M/N is configurable
-    test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_fp8_ptpc])
-    test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_fp8_b])
+    # batch += list(range(128, 256))
+    # batch += [i * 256 for i in range(1, 4)]
+    # batch += [i * 2048 for i in range(1, 5)]
+    # batch += list(range(2048 * 3, 2048 * 3 + 256))
+    # test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_bf16, prec_mxfp4])
+    # # TILE_M/N is configurable
+    # test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_fp8_ptpc])
+    # test.entry_common('mxn_splitk_2s', batch=batch, prec=[prec_fp8_b])
 
     # TODO: support fp8
     test.entry_common('mxn_splitk_1s', batch=batch, prec=[prec_bf16])
@@ -913,31 +913,31 @@ if __name__ == '__main__':
             batch[0] = ext_topk_ids.shape[0]
 
         # Hunyuan
-        for prec in [prec_fp8_t]:
-            TILE_M, TILE_N = 16, 64
-            batch = [2, 4, 8, 16, 32, 64, 128, 256]
-            test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
-            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
-            test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
+        # for prec in [prec_fp8_t]:
+        #     TILE_M, TILE_N = 16, 64
+        #     batch = [2, 4, 8, 16, 32, 64, 128, 256]
+        #     test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        #     test_dec.entry_common('aiter', [1] + batch, prec=[prec])
+        #     test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+        #     test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
 
-            for TILE_M in [64, 128]:
-                TILE_N = 128
-                batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
-                test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-                test_prefill.entry_common('aiter', batch, prec=[prec])
-                test_prefill.entry_common('mxn_2s', batch, prec=[prec])
-                test_dec.show_perf('hunyuan dec')
-                test_prefill.show_perf('hunyuan prefill')
+        #     for TILE_M in [64, 128]:
+        #         TILE_N = 128
+        #         batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+        #         test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        #         test_prefill.entry_common('aiter', batch, prec=[prec])
+        #         test_prefill.entry_common('mxn_2s', batch, prec=[prec])
+        #         test_dec.show_perf('hunyuan dec')
+        #         test_prefill.show_perf('hunyuan prefill')
 
         # Qwen3.5
         HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 128, 512, 10
         for prec in [prec_fp8_ptpc]:
             TILE_M, TILE_N = 16, 64
-            batch = [2, 4, 8, 16, 32, 64, 128, 256]
+            batch = [4, 8, 16, 32, 64, 128, 256]
             test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
-            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+            #test_dec.entry_common('aiter', [1] + batch, prec=[prec])
+            #test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
             test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
 
             for DYN in [True, False]:
@@ -945,9 +945,10 @@ if __name__ == '__main__':
                 if DYN:
                     GATE_TILE_N = 256
                 for TILE_M in [64, 128]:
-                    batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+                    #batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+                    batch = [64,128,256]
                     test_prefill = TestCase(TILE_M, GATE_TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=DYN, STAGE2_TILE_N=DOWN_TILE_N)
-                    test_prefill.entry_common('aiter', batch, prec=[prec])
+                    #test_prefill.entry_common('aiter', batch, prec=[prec])
                     test_prefill.entry_common('mxn_2s', batch, prec=[prec])
                     test_dec.show_perf(f'qwen dec {TILE_M=} {DYN=}')
                     test_prefill.show_perf(f'qwen prefill {TILE_M=} {DYN=}')
