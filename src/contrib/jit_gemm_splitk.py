@@ -156,10 +156,10 @@ def gemm_splitk_wd(J:JIT,
 
     buff_b = J.Buffer(p_weight, N * get_k_bytes(K))
 
-    fp8_ptpc = False if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) else True
+    quant_type_str = 'per_1x128' if (weight_dtype == torch.float8_e4m3fn or weight_dtype == torch.float8_e4m3fnuz) else 'no'
     gemm_splitk(J, weight_dtype, K, N, num_split_k,
                 buff_a, buff_b, p_w_scale,
-                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=True, fp8_ptpc=fp8_ptpc)
+                voffset_a, voffset_b, voffset_scale, C_reg, BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N, BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M, USE_FP4_SHUFFLE_WEIGHT=True, quant_type_str=quant_type_str)
     # split K
     lds_buff = J.LDSTensor([4 * BLOCK_TILE_SIZE_M, 32], torch.float)
     # each 32 N as a group
@@ -203,7 +203,7 @@ def gemm_splitk_wd(J:JIT,
 
             tmp = J.gpr(1, 'vu32')
             tmp[0] = c_offset[0] + m * 16 * stride_C + n * 32 * J.sizeof_bf16
-            J.v_cvt_pk_bf16_f32(c_in_wave[0, 0], c_in_wave[0, 0], c_in_wave[0, 1])
+            J.uni_cvt_pk_bf16_f32(c_in_wave[0, 0], c_in_wave[0, 0], c_in_wave[0, 1])
             J.debug_log(c_in_wave[0, 0], torch_dtype=torch.bfloat16, message=f'{m=}{n=}')
             buff_c.store_dword(c_in_wave[0, 0], tmp, s_c_offset)
         J.s_barrier()
