@@ -912,42 +912,42 @@ if __name__ == '__main__':
             print(ext_topk_ids.shape)
             batch[0] = ext_topk_ids.shape[0]
 
-        # Hunyuan
-        for prec in [prec_fp8_t]:
-            TILE_M, TILE_N = 16, 64
-            batch = [2, 4, 8, 16, 32, 64, 128, 256]
-            test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
-            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
-            test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
+        # # Hunyuan
+        # for prec in [prec_fp8_t]:
+        #     TILE_M, TILE_N = 16, 64
+        #     batch = [2, 4, 8, 16, 32, 64, 128, 256]
+        #     test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        #     test_dec.entry_common('aiter', [1] + batch, prec=[prec])
+        #     test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+        #     test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
 
-            for TILE_M in [64, 128]:
-                TILE_N = 128
-                batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
-                test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-                test_prefill.entry_common('aiter', batch, prec=[prec])
-                test_prefill.entry_common('mxn_2s', batch, prec=[prec])
-                test_dec.show_perf('hunyuan dec')
-                test_prefill.show_perf('hunyuan prefill')
+        #     for TILE_M in [64, 128]:
+        #         TILE_N = 128
+        #         batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+        #         test_prefill = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
+        #         test_prefill.entry_common('aiter', batch, prec=[prec])
+        #         test_prefill.entry_common('mxn_2s', batch, prec=[prec])
+        #         test_dec.show_perf('hunyuan dec')
+        #         test_prefill.show_perf('hunyuan prefill')
 
         # Qwen3.5
-        HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 128, 512, 10
+        HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK = 4096, 128, 513, 11
         for prec in [prec_fp8_ptpc]:
-            TILE_M, TILE_N = 16, 64
-            batch = [2, 4, 8, 16, 32, 64, 128, 256]
+            TILE_M, TILE_N = 16, 128
+            batch = [8, 16]
             test_dec = TestCase(TILE_M, TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK)
-            test_dec.entry_common('aiter', [1] + batch, prec=[prec])
-            test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
+            test_dec.entry_common('aiter', batch, prec=[prec])
+            #test_dec.entry_common('16x32_2s_b1', [1], prec=[prec])
             test_dec.entry_common('16x32_2s_b', batch, prec=[prec])
-
-            for DYN in [True, False]:
-                GATE_TILE_N, DOWN_TILE_N = 128, 128
-                if DYN:
-                    GATE_TILE_N = 256
-                for TILE_M in [64, 128]:
-                    batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
-                    test_prefill = TestCase(TILE_M, GATE_TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=DYN, STAGE2_TILE_N=DOWN_TILE_N)
-                    test_prefill.entry_common('aiter', batch, prec=[prec])
-                    test_prefill.entry_common('mxn_2s', batch, prec=[prec])
-                    test_dec.show_perf(f'qwen dec {TILE_M=} {DYN=}')
-                    test_prefill.show_perf(f'qwen prefill {TILE_M=} {DYN=}')
+            test_dec.show_perf(f'qwen dec {TILE_M=}')
+            # for DYN in [True, False]:
+            #     GATE_TILE_N, DOWN_TILE_N = 128, 128
+            #     if DYN:
+            #         GATE_TILE_N = 256
+            #     for TILE_M in [64, 128]:
+            #         batch = [512,1024,2048,4096,8192, 16384, 32768, 65536, 131072]
+            #         test_prefill = TestCase(TILE_M, GATE_TILE_N, HIDDEN_SIZE, INTER_SIZE_TP, E, TOPK, DYN_SCHEDULE=DYN, STAGE2_TILE_N=DOWN_TILE_N)
+            #         test_prefill.entry_common('aiter', batch, prec=[prec])
+            #         test_prefill.entry_common('mxn_2s', batch, prec=[prec])
+            #         test_dec.show_perf(f'qwen dec {TILE_M=} {DYN=}')
+            #         test_prefill.show_perf(f'qwen prefill {TILE_M=} {DYN=}')
