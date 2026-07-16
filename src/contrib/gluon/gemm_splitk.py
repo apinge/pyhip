@@ -333,7 +333,9 @@ def gemm_splitk_kernel(
                                                     warps_per_cta=[num_warps, 1, 1])
         a_fma_layout: gl.constexpr = gl.DotOperandLayout(0, c_layout, k_width=16)
         b_fma_layout: gl.constexpr = gl.DotOperandLayout(1, c_layout, k_width=16)
-        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + gl.amd.cdna3.warp_id() // 2
+        warp_layout: gl.constexpr = gl.SliceLayout(1, gl.SliceLayout(2, c_layout))
+        warp_id = gl.arange(0, num_warps, layout=warp_layout)[:, None, None]
+        mem_scale_offsets = (tile_n * BLOCK_TILE_SIZE_N // 128) * (K // 128) + warp_id // 2
         weight_scale = gl.load(p_weight_scale + mem_scale_offsets)
     a = gl.amd.cdna3.buffer_load(p_input, mem_a_offsets)
     b = gl.amd.cdna3.buffer_load(p_weight, mem_b_offsets, cache='.cg')
