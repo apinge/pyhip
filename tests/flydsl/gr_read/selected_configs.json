@@ -1,0 +1,20 @@
+{
+  "source": "e09_compensated_tuning.jsonl; 8 checkpoint weight pairs, seed 23, 2 randomized rounds; BF16 activation compensation enabled for unchanged FP64 tolerance",
+  "buckets": [
+    {
+      "max_rows": 24,
+      "config": {
+        "split_k": 16,
+        "block_m": 16,
+        "down_n": 64,
+        "up_n": 128,
+        "block_k": 64,
+        "waves": 4,
+        "skip_padding": true,
+        "preshuffle": true,
+        "fast_math": true,
+        "compensate_hidden": true
+      }
+    }
+  ]
+}
