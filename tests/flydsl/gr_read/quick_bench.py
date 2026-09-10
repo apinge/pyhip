@@ -32,6 +32,9 @@ if __name__ == "__main__":
     parser.add_argument("--no-preshuffle", action="store_true")
     parser.add_argument("--strict-math", action="store_true")
     parser.add_argument("--compensate-hidden", action="store_true")
+    parser.add_argument("--down-mode", choices=["partial", "wave_splitk"], default="partial")
+    parser.add_argument("--down-waves", type=int, default=4)
+    parser.add_argument("--down-block-k", type=int, default=256)
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if args.output is not None and args.output.exists():
@@ -47,6 +50,9 @@ if __name__ == "__main__":
         preshuffle=not args.no_preshuffle,
         fast_math=not args.strict_math,
         compensate_hidden=args.compensate_hidden,
+        down_mode=args.down_mode,
+        down_waves=args.down_waves,
+        down_block_k=args.down_block_k,
     )
     baseline = load_triton_baseline()
     compiled = torch.compile(torch_mix, dynamic=False)
@@ -57,12 +63,8 @@ if __name__ == "__main__":
         torch.testing.assert_close(kernel(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
         candidates = {"flydsl": lambda: kernel(x)}
         if args.stages:
-            candidates["down_only"] = lambda: kernel.down(
-                x.view(-1), kernel.w_down, kernel.partial, torch.cuda.current_stream()
-            )
-            candidates["up_only"] = lambda: kernel.up(
-                x.view(-1), kernel.w_up, kernel.partial, kernel.output.view(-1), torch.cuda.current_stream()
-            )
+            candidates["down_only"] = lambda: kernel.run_down(x)
+            candidates["up_only"] = lambda: kernel.run_up(x)
         if not args.skip_baselines:
             candidates["torch_compile"] = lambda: compiled(x, wd, wu)
             if rows <= 16:

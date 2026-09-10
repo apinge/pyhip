@@ -27,8 +27,12 @@ if __name__ == "__main__":
     y = kernel(x)
     torch.cuda.synchronize()
     down_ref = F.linear(x.double(), wd.double())
-    down = kernel.partial.reshape(kernel.config.split_k, -1, 320).sum(0)[: args.rows]
-    print("down max error", (down.double() - down_ref).abs().max().item(), flush=True)
+    if kernel.config.down_mode == "partial":
+        down = kernel.partial.reshape(kernel.config.split_k, -1, 320).sum(0)[: args.rows]
+        print("down max error", (down.double() - down_ref).abs().max().item(), flush=True)
+    else:
+        activation = kernel.partial.reshape(-1, 320)[: args.rows]
+        print("activation max error", (activation.double() - F.silu(down_ref / 4)).abs().max().item(), flush=True)
     ref = reference(x, wd, wu)
     print("output max error", (y.double() - ref).abs().max().item(), flush=True)
     torch.testing.assert_close(y.double(), ref, rtol=1e-2, atol=5e-3)

@@ -14,9 +14,15 @@ def test_matches_fp64(rows):
     kernel = GRRead(rows, wd, wu)
     actual = kernel(x)
     torch.testing.assert_close(actual.double(), reference(x, wd, wu), **TOLERANCES[dtype])
-    down = kernel.partial.reshape(kernel.config.split_k, -1, 320).sum(0)[:rows]
     expected_down = x.double() @ wd.double().T
-    torch.testing.assert_close(down.double(), expected_down, rtol=2e-5, atol=2e-5)
+    if kernel.config.down_mode == "partial":
+        down = kernel.partial.reshape(kernel.config.split_k, -1, 320).sum(0)[:rows]
+        torch.testing.assert_close(down.double(), expected_down, rtol=2e-5, atol=2e-5)
+    else:
+        activation = kernel.partial.reshape(-1, 320)[:rows]
+        torch.testing.assert_close(
+            activation.double(), torch.nn.functional.silu(expected_down / 4), rtol=2e-5, atol=2e-5
+        )
 
 
 @pytest.mark.parametrize("rows", [1, 4, 7, 16, 17, 24])
@@ -101,3 +107,29 @@ def test_checkpoint_mtp_activation_rounding_regression():
     legacy = GRRead(10, case["wd"], case["wu"], Config(compensate_hidden=False))(case["x"])
     tol = TOLERANCES[torch.bfloat16]
     assert ((legacy.double() - ref).abs() / (tol["atol"] + tol["rtol"] * ref.abs())).max() > 1
+
+
+@pytest.mark.parametrize("rows", range(1, 25))
+def test_fused_down_wave_splitk(rows):
+    x, wd, wu = synthetic(rows, seed=43)
+    config = Config(down_mode="wave_splitk", down_n=16, down_waves=4, down_block_k=512, compensate_hidden=True)
+    kernel = GRRead(rows, wd, wu, config)
+    torch.testing.assert_close(kernel(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
+    activation = torch.nn.functional.silu(x.double() @ wd.double().T / 4)
+    torch.testing.assert_close(kernel.partial.reshape(-1, 320)[:rows].double(), activation, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("rows", [1, 17, 24])
+def test_fused_down_repeated_graph_replay(rows):
+    x, wd, wu = synthetic(rows, seed=47)
+    kernel = GRRead(rows, wd, wu, Config(down_mode="wave_splitk", down_n=16, down_block_k=512, compensate_hidden=True))
+    for _ in range(3):
+        kernel(x)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = kernel(x)
+    for _ in range(4):
+        x.mul_(0.9).add_(0.0625)
+        for _ in range(250):
+            graph.replay()
+        torch.testing.assert_close(output.double(), reference(x, wd, wu), **TOLERANCES[x.dtype])

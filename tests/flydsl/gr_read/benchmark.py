@@ -21,6 +21,7 @@ from support import (
     TOLERANCES,
     capture,
     checkpoint_pairs,
+    load_flydsl_baseline,
     load_triton_baseline,
     reference,
     time_graph,
@@ -55,6 +56,7 @@ def main():
     parser.add_argument("--graph-repeats", type=int, default=2)
     parser.add_argument("--configs", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--previous-kernel", type=Path)
     args = parser.parse_args()
     if any(not 1 <= row <= 24 for row in args.rows):
         raise ValueError("benchmark rows must be 1..24")
@@ -78,6 +80,7 @@ def main():
     torch._dynamo.config.fail_on_recompile_limit_hit = True
     torch_compiled = torch.compile(torch_mix, dynamic=False, fullgraph=True)
     baseline = load_triton_baseline()
+    previous = load_flydsl_baseline(args.previous_kernel) if args.previous_kernel else None
     rng = random.Random(args.seed)
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
     props = torch.cuda.get_device_properties(0)
@@ -106,6 +109,11 @@ def main():
             "reference": "same formula in FP64; synthetic BF16 normalized inputs, actual checkpoint HC weights",
             "measurement": "HIP events around graph replay; warmup, JIT, weight packing and reference excluded",
         }
+        if previous:
+            previous_source = args.previous_kernel.read_bytes()
+            metadata["previous_flydsl_source"] = str(args.previous_kernel)
+            metadata["previous_flydsl_sha256"] = hashlib.sha256(previous_source).hexdigest()
+            args.output.with_name(args.output.stem + ".previous_kernel.py").write_bytes(previous_source)
         for name in ("kernel.py", "support.py", "benchmark.py"):
             content = Path(__file__).with_name(name).read_bytes()
             destination = args.output.with_name(args.output.stem + "." + name)
@@ -134,6 +142,10 @@ def main():
                     lambda x=x, wd=wd, wu=wu: torch_compiled(x, wd, wu) for x, (_, wd, wu) in zip(xs, pairs)
                 ],
             }
+            previous_kernels = None
+            if previous:
+                previous_kernels = [previous.GRRead(rows, wd, wu) for _, wd, wu in pairs]
+                implementations["previous_flydsl"] = [lambda k=k, x=x: k(x) for k, x in zip(previous_kernels, xs)]
             if rows <= 16:
                 implementations["tuned_triton"] = [
                     lambda x=x, wd=wd, wu=wu: baseline.fused_hc_mix(x, wd, wu, 4, 2560)
@@ -151,7 +163,7 @@ def main():
                 graph, count = capture(calls, repeats=args.graph_repeats)
                 graph.replay()
                 errors = [output_error(out, ref) for out, ref in zip(outputs, refs)]
-                if name == "flydsl":
+                if name in ("flydsl", "previous_flydsl"):
                     for out, ref in zip(outputs, refs):
                         torch.testing.assert_close(out.double(), ref, **TOLERANCES[torch.bfloat16])
                 results[name] = {
@@ -202,6 +214,10 @@ def main():
                 "speedup": results[primary]["median_us"] / results["flydsl"]["median_us"],
                 "speedup_vs_torch_compile": results["torch_compile"]["median_us"] / results["flydsl"]["median_us"],
             }
+            if previous:
+                record["speedup_vs_previous_flydsl"] = (
+                    results["previous_flydsl"]["median_us"] / results["flydsl"]["median_us"]
+                )
             log.write(json.dumps(record) + "\n")
             log.flush()
             medians = {name: round(value["median_us"], 3) for name, value in results.items()}
@@ -209,7 +225,19 @@ def main():
                 f"T={rows}: {medians}, primary speedup={record['speedup']:.3f}x; all {len(pairs)} pairs passed",
                 flush=True,
             )
-            del graphs, implementations, kernels, refs, xs, retained_outputs, outputs, calls, graph, fly_graph
+            del (
+                graphs,
+                implementations,
+                kernels,
+                refs,
+                xs,
+                retained_outputs,
+                outputs,
+                calls,
+                graph,
+                fly_graph,
+                previous_kernels,
+            )
 
 
 if __name__ == "__main__":

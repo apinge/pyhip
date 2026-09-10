@@ -1,4 +1,4 @@
-"""Qwen3.8 GR read using gfx942 MFMA and two FlyDSL launches.
+"""Experimental E17 clone: low-fragment prefetch and padded hidden LDS strides.
 
 Layout/fragment usage follows ../test_gemm.py and FlyDSL's tiled GEMM examples.
 The SiLU and gated-mean epilogues follow SGLang's CuTe HC mix implementation.
@@ -41,6 +41,8 @@ class Config:
     down_interleave: bool = True
     down_copy_bits: int = 128
     down_block_k: int = 256
+    prefetch_low: bool = True
+    hidden_pad: int = 0
 
     def validate(self):
         if self.down_mode not in ("partial", "wave_splitk"):
@@ -58,7 +60,12 @@ class Config:
             raise ValueError("N tiles must contain each wave's MFMA tile")
         if R % self.block_k or self.block_k % 16:
             raise ValueError("block_k must be a multiple of 16 dividing 320")
-        lds_bytes = self.block_m * R * 2 * (2 if self.compensate_hidden else 1) + self.block_m * self.up_n * 4
+        if self.hidden_pad not in (0, 4, 8, 16, 32):
+            raise ValueError("hidden_pad must preserve 64-bit copy alignment")
+        lds_bytes = (
+            self.block_m * (R + self.hidden_pad) * 2 * (2 if self.compensate_hidden else 1)
+            + self.block_m * self.up_n * 4
+        )
         if lds_bytes > 65536:
             raise ValueError("up kernel exceeds gfx942's 64 KiB LDS capacity")
         if self.down_mode == "wave_splitk":
@@ -77,6 +84,8 @@ def _launchers(rows: int, dtype: torch.dtype, config: Config):
     # FlyDSL 0.3.1 hashes scalar closure values, not fields of config objects.
     skip_padding, preshuffle, fast_math = config.skip_padding, config.preshuffle, config.fast_math
     compensate_hidden = config.compensate_hidden
+    prefetch_low = config.prefetch_low
+    hidden_stride = R + config.hidden_pad
     down_mode, down_waves = config.down_mode, config.down_waves
     down_flip, down_interleave, down_copy_bits = config.down_flip, config.down_interleave, config.down_copy_bits
     down_block_k = config.down_block_k
@@ -86,8 +95,8 @@ def _launchers(rows: int, dtype: torch.dtype, config: Config):
 
     @fx.struct
     class UpShared:
-        hidden: fx.Array[elem, bm * R, 16]
-        hidden_low: fx.Array[elem, bm * R if compensate_hidden else 1, 16]
+        hidden: fx.Array[elem, bm * hidden_stride, 16]
+        hidden_low: fx.Array[elem, bm * hidden_stride if compensate_hidden else 1, 16]
         logits: fx.Array[fx.Float32, bm * un, 16]
 
     @fx.struct
@@ -215,14 +224,14 @@ def _launchers(rows: int, dtype: torch.dtype, config: Config):
         tid = fx.thread_idx.x
         im, jn, _ = fx.block_idx
         shared = fx.SharedAllocator().allocate(UpShared).peek()
-        h = shared.hidden.view(fx.make_layout((bm, R), (R, 1)))
+        h = shared.hidden.view(fx.make_layout((bm, R), (hidden_stride, 1)))
         c = shared.logits.view(fx.make_layout((bm, un), (un, 1)))
         p = fx.rocdl.make_buffer_tensor(P, max_size=False)
         p4 = fx.flat_divide(p, fx.make_tile(4))
-        h4 = fx.flat_divide(shared.hidden.view(fx.make_layout(bm * R, 1)), fx.make_tile(4))
+        h4 = shared.hidden.view(fx.make_layout((4, (R // 4, bm)), (1, (4, hidden_stride))))
         if fx.const_expr(compensate_hidden):
-            h_low = shared.hidden_low.view(fx.make_layout((bm, R), (R, 1)))
-            h_low4 = fx.flat_divide(shared.hidden_low.view(fx.make_layout(bm * R, 1)), fx.make_tile(4))
+            h_low = shared.hidden_low.view(fx.make_layout((bm, R), (hidden_stride, 1)))
+            h_low4 = shared.hidden_low.view(fx.make_layout((4, (R // 4, bm)), (1, (4, hidden_stride))))
         copy_p = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
         copy_h = fx.make_copy_atom(fx.UniversalCopy64b(), elem)
         fp = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Float32)
@@ -285,18 +294,27 @@ def _launchers(rows: int, dtype: torch.dtype, config: Config):
         fa = thr.make_fragment_A(a_tile[None, None, 0])
         fb = thr.make_fragment_B(b_tile[None, None, 0])
         fc = thr.make_fragment_C(c)
+        if fx.const_expr(compensate_hidden and prefetch_low):
+            fa_low = thr.make_fragment_A(a_tile[None, None, 0])
         fc.fill(0)
         ga, gb = ca.partition_S(a_tile), cb.partition_S(b_tile)
         if fx.const_expr(compensate_hidden):
             ga_low = ca.partition_S(a_low_tile)
         ra, rb = ca.retile(fa), cb.retile(fb)
+        if fx.const_expr(compensate_hidden and prefetch_low):
+            ra_low = ca.retile(fa_low)
         for ki in range_constexpr(R // bk):
             fx.copy(copy_a, ga[None, None, None, ki], ra)
+            if fx.const_expr(compensate_hidden and prefetch_low):
+                fx.copy(copy_a, ga_low[None, None, None, ki], ra_low)
             fx.copy(copy_b, gb[None, None, None, ki], rb)
             fx.gemm(mma, fc, fa, fb, fc)
             if fx.const_expr(compensate_hidden):
-                fx.copy(copy_a, ga_low[None, None, None, ki], ra)
-                fx.gemm(mma, fc, fa, fb, fc)
+                if fx.const_expr(prefetch_low):
+                    fx.gemm(mma, fc, fa_low, fb, fc)
+                else:
+                    fx.copy(copy_a, ga_low[None, None, None, ki], ra)
+                    fx.gemm(mma, fc, fa, fb, fc)
         fx.copy(copy_c, cc.retile(fc), cc.partition_D(c))
         fx.gpu.barrier()
 

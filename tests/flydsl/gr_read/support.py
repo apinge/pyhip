@@ -1,5 +1,6 @@
 """Reference, baseline loading, checkpoint selection and graph timing."""
 
+import hashlib
 import importlib.util
 import json
 import statistics
@@ -40,6 +41,18 @@ def load_triton_baseline():
     name = "gr_read_existing_triton_baseline"
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, BASELINE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return sys.modules[name]
+
+
+def load_flydsl_baseline(path):
+    """Import an immutable earlier kernel snapshot for matched A/B tests."""
+    path = Path(path)
+    name = "gr_read_flydsl_baseline_" + hashlib.sha256(path.read_bytes()).hexdigest()[:12]
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)

@@ -12,11 +12,34 @@ from pathlib import Path
 
 import torch
 from kernel import Config, GRRead
-from support import TOLERANCES, capture, checkpoint_pairs, reference, time_graph
+from support import (
+    TOLERANCES,
+    capture,
+    checkpoint_pairs,
+    load_flydsl_baseline,
+    reference,
+    time_graph,
+)
 
 
 def configurations(rows, family):
     base = Config(split_k=8, down_n=32, waves=2, block_m=32 if rows > 16 else 16)
+    if family == "wave_fused":
+        base = Config(down_mode="wave_splitk", down_n=16, down_waves=4, down_block_k=256, compensate_hidden=True)
+        return [
+            ("wave4_n16_k256", base),
+            ("wave4_n32_k256", replace(base, down_n=32)),
+            ("wave4_n64_k256", replace(base, down_n=64)),
+            ("wave4_n16_k512", replace(base, down_block_k=512)),
+            ("wave4_n32_k512", replace(base, down_n=32, down_block_k=512)),
+            ("wave4_n16_k128", replace(base, down_block_k=128)),
+            ("wave4_n16_up64", replace(base, up_n=64)),
+            ("wave4_n16_k512_up64", replace(base, down_block_k=512, up_n=64)),
+            ("wave4_n32_k512_up64", replace(base, down_n=32, down_block_k=512, up_n=64)),
+            ("wave4_contiguous_k", replace(base, down_interleave=False)),
+            ("wave4_no_flip", replace(base, down_flip=False)),
+            ("wave4_m32", replace(base, block_m=32)),
+        ]
     if family == "compensated":
         base = replace(base, waves=4, down_n=64, split_k=16, compensate_hidden=True)
         return [
@@ -63,7 +86,8 @@ def main():
     parser.add_argument("--seed", type=int, default=23)
     parser.add_argument("--samples", type=int, default=7)
     parser.add_argument("--rounds", type=int, default=2)
-    parser.add_argument("--family", choices=["initial", "refine", "compensated"], default="initial")
+    parser.add_argument("--family", choices=["initial", "refine", "compensated", "wave_fused"], default="initial")
+    parser.add_argument("--previous-kernel", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -81,6 +105,11 @@ def main():
             "rows": args.rows,
             "kernel_sha256": hashlib.sha256(Path(__file__).with_name("kernel.py").read_bytes()).hexdigest(),
         }
+        snapshot = args.output.with_name(args.output.stem + ".kernel.py")
+        snapshot.write_bytes(Path(__file__).with_name("kernel.py").read_bytes())
+        previous = load_flydsl_baseline(args.previous_kernel) if args.previous_kernel else None
+        if previous:
+            header["previous_kernel"] = str(args.previous_kernel)
         log.write(json.dumps(header) + "\n")
         log.flush()
         rng = random.Random(args.seed)
@@ -88,6 +117,16 @@ def main():
         for rows in args.rows:
             xs = [torch.randn(rows, 10240, dtype=torch.bfloat16, device="cuda", generator=generator) for _ in pairs]
             refs = [reference(x, wd, wu) for x, (_, wd, wu) in zip(xs, pairs)]
+            if previous:
+                old_kernels = [previous.GRRead(rows, wd, wu) for _, wd, wu in pairs]
+                old_calls = [lambda k=k, x=x: k(x) for k, x in zip(old_kernels, xs)]
+                old_graph, old_count = capture(old_calls, repeats=4)
+                old_timing = time_graph(old_graph, old_count, samples=args.samples)
+                old_record = {"type": "previous", "rows": rows, **old_timing}
+                print(json.dumps(old_record), flush=True)
+                log.write(json.dumps(old_record) + "\n")
+                log.flush()
+                del old_kernels, old_calls, old_graph
             configs = configurations(rows, args.family)
             timings = {name: [] for name, _ in configs}
             for round_id in range(args.rounds):
