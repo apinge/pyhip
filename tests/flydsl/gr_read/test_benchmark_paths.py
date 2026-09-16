@@ -47,6 +47,19 @@ def main():
                 (["--model-path", str(model), "--triton-kernel", str(root / "missing.py")], "set --triton-kernel"),
                 (["--model-path", str(model), "--triton-kernel", str(first)], "verified 8cf5501b baseline"),
             ]
+            if script == "bench_three_stage.py":
+                cases.append(
+                    (
+                        [
+                            "--synthetic",
+                            "--model-path",
+                            str(root / "missing_model"),
+                            "--triton-kernel",
+                            str(root / "missing.py"),
+                        ],
+                        "set --triton-kernel",
+                    )
+                )
             for options, expected in cases:
                 completed = subprocess.run(command + options, capture_output=True, text=True, timeout=60)
                 assert completed.returncode == 2, completed.stderr
@@ -55,7 +68,7 @@ def main():
         assert not (root / "unused.jsonl").exists()
 
     assert not torch.cuda.is_initialized()
-    print("PASS: bundled SHA, source-specific loader cache, and model/Triton CLI errors (no GPU required)")
+    print("PASS: bundled SHA, source-specific loader cache, model/Triton CLI errors and synthetic model-path bypass")
 
 
 if __name__ == "__main__":

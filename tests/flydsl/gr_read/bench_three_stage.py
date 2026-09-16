@@ -1,4 +1,4 @@
-"""Matched graph and ordinary Python eager measurements on real HC weights."""
+"""Matched graph/eager measurements with checkpoint or synthetic BF16 weights."""
 
 import argparse
 import hashlib
@@ -31,6 +31,7 @@ from support import (
     load_flydsl_baseline,
     load_triton_baseline,
     reference,
+    synthetic,
     time_graph,
     torch_mix,
 )
@@ -88,6 +89,11 @@ def main():
     parser.add_argument("--rows", nargs="+", type=int, default=[1, 4, 8, 16, 17, 24])
     parser.add_argument("--weights", type=int, default=8)
     parser.add_argument(
+        "--synthetic",
+        action="store_true",
+        help="generate random BF16 weight pairs; no model files needed (ignores --model-path)",
+    )
+    parser.add_argument(
         "--model-path", type=Path, default=MODEL_PATH, help="checkpoint directory containing the safetensors index"
     )
     parser.add_argument("--rounds", type=int, default=2)
@@ -125,8 +131,12 @@ def main():
         raise ValueError("LDS padding options require --prefetch-kernel")
     if args.previous_kernel and not args.previous_kernel.is_file():
         parser.error("--previous-kernel must point to an existing GRRead Python source file")
-    if not (args.model_path / "model.safetensors.index.json").is_file():
-        parser.error(f"checkpoint index not found under {args.model_path}; set --model-path to the model directory")
+    if not args.synthetic and not (args.model_path / "model.safetensors.index.json").is_file():
+        parser.error(
+            f"checkpoint index not found under {args.model_path}; set --model-path to the model directory "
+            "or use --synthetic for standalone random-weight benchmarking"
+        )
+    weight_source = "synthetic" if args.synthetic else "checkpoint"
     options = (
         [(64, 1), (64, 2), (64, 4), (128, 1), (128, 2), (256, 1)]
         if args.sweep
@@ -165,7 +175,12 @@ def main():
                 "hip": torch.version.hip,
                 "flydsl": importlib.metadata.version("flydsl"),
                 "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
-                "input": "actual BF16 checkpoint weights; seeded synthetic normalized BF16 inputs",
+                "weight_source": weight_source,
+                "input": (
+                    "seeded synthetic BF16 weights (scale=0.02); seeded synthetic normalized BF16 inputs"
+                    if args.synthetic
+                    else "actual BF16 checkpoint weights; seeded synthetic normalized BF16 inputs"
+                ),
                 "graph": "2 repetitions of all weight pairs; 3 replays/sample; HIP events; full GR read",
                 "eager": "ordinary prepared Python readers, synchronized at batch boundaries, no capture or per-call sync",
                 "eager_caveat": "wall and event span include host-path effects; differences are not pure hardware launch cost",
@@ -194,7 +209,13 @@ def main():
                 meta["sources"][name] = {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}
                 with args.output.with_name(args.output.stem + "." + name).open("xb") as snapshot:
                     snapshot.write(content)
-        pairs = list(checkpoint_pairs(limit=args.weights, model_path=args.model_path))
+        if args.synthetic:
+            pairs = []
+            for index in range(args.weights):
+                _, wd, wu = synthetic(1, seed=args.seed + index, scale=0.02)
+                pairs.append((f"synthetic_{index}", wd, wu))
+        else:
+            pairs = list(checkpoint_pairs(limit=args.weights, model_path=args.model_path))
         if len(pairs) != args.weights:
             raise ValueError("requested more checkpoint pairs than available")
         if log is not None:
@@ -204,7 +225,7 @@ def main():
         rng = random.Random(args.seed)
         generator = torch.Generator(device="cuda").manual_seed(args.seed)
         for rows in args.rows:
-            print(f"T={rows}: preparing {len(pairs)} real weight pairs", flush=True)
+            print(f"T={rows}: preparing {len(pairs)} {weight_source} weight pairs", flush=True)
             xs = [torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in pairs]
             refs = [reference(x, wd, wu) for x, (_, wd, wu) in zip(xs, pairs)]
             implementations = {}
@@ -298,11 +319,17 @@ def main():
                         v for sample in result["eager_rounds"] for v in sample[metric + "_samples_us"]
                     )
             if log is not None:
-                record = {"type": "result", "rows": rows, "weight_pairs": len(pairs), "results": results}
+                record = {
+                    "type": "result",
+                    "rows": rows,
+                    "weight_pairs": len(pairs),
+                    "weight_source": weight_source,
+                    "results": results,
+                }
                 log.write(json.dumps(record) + "\n")
                 log.flush()
             width = max(len("Backend"), max(len(name) for name in results))
-            print(f"T={rows}, weights={len(pairs)}: median us / GR read", flush=True)
+            print(f"T={rows}, weights={len(pairs)}, source={weight_source}: median us / GR read", flush=True)
             print(f"{'Backend':<{width}}  {'Graph':>10}  {'Eager wall':>12}", flush=True)
             for name, result in results.items():
                 print(

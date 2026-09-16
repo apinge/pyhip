@@ -186,8 +186,28 @@ launch uses the current stream at invocation time, including the capture stream.
 The reference and benchmark input generators use actual checkpoint weights with
 synthetic normalized inputs, not recorded model activations.
 
-To benchmark the optimized entry and current comparison backends, print results
-directly. No output file, previous result directory or V1 snapshot is required:
+For a standalone benchmark without model files or SGLang, use `--synthetic`.
+This exercises the same candidates, including the final padded entry, and
+prints results directly:
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 bench_three_stage.py --synthetic \
+  --rows 6 --weights 100 --rounds 3 --samples 7 --combined-host \
+  --prefetch-kernel ./prefetch_up.py --hidden-pad 4 --reduce-threads 128 --reduce-vec 1
+```
+
+Here `--weights 100` generates and rotates 100 random BF16 down/up weight pairs
+at the model's fixed shapes. `--seed` controls generation; the synthetic weight
+scale is 0.02. `--model-path` is ignored in this explicit mode. The table and
+optional JSONL record `source=synthetic` / `weight_source`; these are screening
+results, not real-checkpoint acceptance. There is no automatic fallback from
+missing model files to random weights. Add `--baselines` for the bundled
+Triton/Torch comparison, also without SGLang.
+
+For real-checkpoint benchmarking, omit `--synthetic` and provide the model
+directory with `--model-path` if it is not at the default location. No output
+file, previous result directory or V1 snapshot is required:
 
 ```bash
 HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
@@ -210,7 +230,8 @@ load Triton. Run `python3 test_benchmark_paths.py` for CPU-only path checks.
 SGLang is optional for all these standalone kernel checks. Without
 `--baselines`, `bench_three_stage.py` does not load the Triton baseline or
 prepare the Torch compile comparison. Real-weight benchmarking still needs the
-checkpoint; for a final-entry correctness/debug check with random weights, use
+checkpoint; standalone `--synthetic` benchmarking does not. For a final-entry
+correctness/debug check with random weights, use
 `python3 test_final_entry.py --rows 6 --graph`. For synthetic E17/configuration
 screening without model files or baseline loading, use:
 
