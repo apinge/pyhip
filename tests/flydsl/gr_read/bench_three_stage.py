@@ -23,6 +23,8 @@ from kernel import GRRead
 from register_gate import RegisterGateGRRead
 from support import (
     BASELINE_PATH,
+    BASELINE_SHA256,
+    MODEL_PATH,
     TOLERANCES,
     capture,
     checkpoint_pairs,
@@ -85,6 +87,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", nargs="+", type=int, default=[1, 4, 8, 16, 17, 24])
     parser.add_argument("--weights", type=int, default=8)
+    parser.add_argument(
+        "--model-path", type=Path, default=MODEL_PATH, help="checkpoint directory containing the safetensors index"
+    )
     parser.add_argument("--rounds", type=int, default=2)
     parser.add_argument("--samples", type=int, default=5)
     parser.add_argument("--seed", type=int, default=101)
@@ -92,6 +97,12 @@ def main():
     parser.add_argument("--register-gate", action="store_true")
     parser.add_argument("--combined-host", action="store_true")
     parser.add_argument("--baselines", action="store_true")
+    parser.add_argument(
+        "--triton-kernel",
+        type=Path,
+        default=BASELINE_PATH,
+        help="Triton baseline source; defaults to the bundled 8cf5501b copy",
+    )
     parser.add_argument(
         "--previous-kernel", type=Path, help="optional earlier GRRead Python source to remeasure as the v1 backend"
     )
@@ -114,6 +125,8 @@ def main():
         raise ValueError("LDS padding options require --prefetch-kernel")
     if args.previous_kernel and not args.previous_kernel.is_file():
         parser.error("--previous-kernel must point to an existing GRRead Python source file")
+    if not (args.model_path / "model.safetensors.index.json").is_file():
+        parser.error(f"checkpoint index not found under {args.model_path}; set --model-path to the model directory")
     options = (
         [(64, 1), (64, 2), (64, 4), (128, 1), (128, 2), (256, 1)]
         if args.sweep
@@ -123,12 +136,16 @@ def main():
     prefetch = load_flydsl_baseline(args.prefetch_kernel) if args.prefetch_kernel else None
     triton_baseline = torch_compiled = None
     if args.baselines:
-        if (
-            hashlib.sha256(BASELINE_PATH.read_bytes()).hexdigest()
-            != "647a90bf2622e8e145e2b9784059afb9ed9593287f7ce54b980eb54e6b669854"
-        ):
-            raise RuntimeError("Triton baseline differs from the verified 8cf5501b source")
-        triton_baseline = load_triton_baseline()
+        if any(rows <= 16 for rows in args.rows):
+            if not args.triton_kernel.is_file():
+                parser.error(
+                    f"Triton source not found: {args.triton_kernel}; restore baselines/hc_mix_triton.py or set --triton-kernel"
+                )
+            if hashlib.sha256(args.triton_kernel.read_bytes()).hexdigest() != BASELINE_SHA256:
+                parser.error(
+                    f"Triton source {args.triton_kernel} differs from the verified 8cf5501b baseline; use the bundled copy"
+                )
+            triton_baseline = load_triton_baseline(args.triton_kernel)
         torch._dynamo.config.recompile_limit = 64
         torch._dynamo.config.fail_on_recompile_limit_hit = True
         torch_compiled = torch.compile(torch_mix, dynamic=False, fullgraph=True)
@@ -168,8 +185,8 @@ def main():
             }
             if previous is not None:
                 source_paths["previous_kernel.py"] = args.previous_kernel
-            if args.baselines:
-                source_paths["hc_mix_triton.py"] = BASELINE_PATH
+            if triton_baseline is not None:
+                source_paths["hc_mix_triton.py"] = args.triton_kernel
             if args.prefetch_kernel:
                 source_paths["prefetch_kernel.py"] = args.prefetch_kernel
             for name, path in source_paths.items():
@@ -177,7 +194,7 @@ def main():
                 meta["sources"][name] = {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}
                 with args.output.with_name(args.output.stem + "." + name).open("xb") as snapshot:
                     snapshot.write(content)
-        pairs = list(checkpoint_pairs(limit=args.weights))
+        pairs = list(checkpoint_pairs(limit=args.weights, model_path=args.model_path))
         if len(pairs) != args.weights:
             raise ValueError("requested more checkpoint pairs than available")
         if log is not None:

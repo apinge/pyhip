@@ -54,8 +54,11 @@ if __name__ == "__main__":
         down_waves=args.down_waves,
         down_block_k=args.down_block_k,
     )
-    baseline = load_triton_baseline()
-    compiled = torch.compile(torch_mix, dynamic=False)
+    baseline = compiled = None
+    if not args.skip_baselines:
+        if any(rows <= 16 for rows in args.rows):
+            baseline = load_triton_baseline()
+        compiled = torch.compile(torch_mix, dynamic=False)
     results = []
     for rows in args.rows:
         x, wd, wu = synthetic(rows)

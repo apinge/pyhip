@@ -16,7 +16,9 @@ TOLERANCES = {
     torch.float16: dict(rtol=2e-3, atol=1e-3),
 }
 MODEL_PATH = Path("/models/Qwen3.8-Flash-Next-FP8")
-BASELINE_PATH = Path("/opt/sglang/python/sglang/srt/layers/hc_mix_triton.py")
+BASELINE_PATH = Path(__file__).resolve().parent / "baselines" / "hc_mix_triton.py"
+BASELINE_COMMIT = "8cf5501b6913f57a2e7c8dcee52b625fc8ab23c3"
+BASELINE_SHA256 = "647a90bf2622e8e145e2b9784059afb9ed9593287f7ce54b980eb54e6b669854"
 
 
 def torch_mix(x, w_down, w_up):
@@ -37,10 +39,11 @@ def synthetic(rows, dtype=torch.bfloat16, seed=0, scale=0.02):
     return x, wd, wu
 
 
-def load_triton_baseline():
-    name = "gr_read_existing_triton_baseline"
+def load_triton_baseline(path=BASELINE_PATH):
+    path = Path(path).resolve()
+    name = "gr_read_triton_baseline_" + hashlib.sha256(path.read_bytes()).hexdigest()[:12]
     if name not in sys.modules:
-        spec = importlib.util.spec_from_file_location(name, BASELINE_PATH)
+        spec = importlib.util.spec_from_file_location(name, path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)

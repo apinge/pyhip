@@ -96,7 +96,9 @@ validated LDS padding and host submission options itself.
 | `kernel.py` | FlyDSL kernels, preparation, shape/device guards, fixed configuration |
 | `test_gr_read.py` | BF16 correctness, graph replay, cache-key isolation, recorded rounding regression |
 | `test_final_entry.py` | Plain Python final-entry checks with `assert torch.allclose`, graph replay and `--debug` |
-| `support.py` | FP64 reference, exact local Triton baseline, checkpoint loading and timing |
+| `support.py` | FP64 reference, bundled Triton baseline loading, checkpoint loading and timing |
+| `baselines/hc_mix_triton.py` | Unmodified `8cf5501b` Triton baseline, bundled with upstream Apache-2.0 license |
+| `test_benchmark_paths.py` | Plain Python CPU checks for bundled baseline, loader cache and configurable input paths |
 | `benchmark.py` | All 100 checkpoint pairs, all 24 row counts, randomized order, optional previous FlyDSL baseline |
 | `selected_configs.json` | Accepted per-row configurations with activation compensation enabled |
 | `tune.py` | Explicit, recorded configuration sweeps, including `--family wave_fused` |
@@ -147,13 +149,17 @@ Its GPU kernel is `_hc_mix_persistent_kernel`; `fused_hc_mix` is the Python
 wrapper. The optional previous FlyDSL snapshot is timed in the same randomized
 backend order, not compared against a historical timing from another run.
 
-The checkpoint tools assume the model is at `/models/Qwen3.8-Flash-Next-FP8`
-and the SGLang baseline checkout is at `/opt/sglang`. The linked full report,
+The checkpoint tools default to `/models/Qwen3.8-Flash-Next-FP8`.
+Both `bench_three_stage.py` and `benchmark.py` accept `--model-path` for another
+location. The tuned Triton source is bundled under `baselines/`, so no SGLang
+checkout or installation is needed. `--triton-kernel /path/to/hc_mix_triton.py`
+can select an explicit source file; the same `8cf5501b` SHA256 check still applies.
+See `baselines/README.md` for provenance and licensing. The linked full report,
 benchmark outputs, IR dumps and checkpoint-derived `.pt` samples are local
 experiment artifacts and are not included in this repository.
 
 The MTP regression test skips when its checkpoint-derived sample is absent.
-On a machine with the model and baseline above, recreate the expected sample
+On a machine with the model at the default path, recreate the expected sample
 with the following command, provided the output directory does not already exist:
 
 ```bash
@@ -194,6 +200,29 @@ HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
 Results print as a table with Graph and Eager wall medians in us per complete
 GR read. Add `--output /path/to/new_results.jsonl` only when JSONL samples,
 metadata and source snapshots are needed; existing files are never overwritten.
+
+For a checkpoint stored elsewhere, append `--model-path /path/to/Qwen3.8-Flash-Next-FP8`.
+The default Triton baseline follows the repository location, not `/opt/sglang`.
+Sync the `baselines/` directory along with the scripts when moving to another
+machine. A `--baselines` run with only T=17..24 uses Torch compile and does not
+load Triton. Run `python3 test_benchmark_paths.py` for CPU-only path checks.
+
+SGLang is optional for all these standalone kernel checks. Without
+`--baselines`, `bench_three_stage.py` does not load the Triton baseline or
+prepare the Torch compile comparison. Real-weight benchmarking still needs the
+checkpoint; for a final-entry correctness/debug check with random weights, use
+`python3 test_final_entry.py --rows 6 --graph`. For synthetic E17/configuration
+screening without model files or baseline loading, use:
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 quick_bench.py --rows 1 6 --skip-baselines \
+  --split-k 16 --down-n 64 --waves 4 --compensate-hidden
+```
+
+This quick benchmark targets `kernel.GRRead`, not the final padded entry, and
+uses one synthetic weight pair per T; do not compare its cache-hot timings to
+the rotating-checkpoint acceptance results.
 
 The optional `--previous-kernel /path/to/v1_kernel.py` adds an earlier `GRRead`
 implementation as the `v1` backend. It loads Python source, reruns that kernel in

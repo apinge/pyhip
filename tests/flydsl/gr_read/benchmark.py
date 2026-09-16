@@ -7,7 +7,6 @@ import json
 import os
 import random
 import statistics
-import subprocess
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -16,7 +15,9 @@ import torch
 import triton
 from kernel import Config, GRRead
 from support import (
+    BASELINE_COMMIT,
     BASELINE_PATH,
+    BASELINE_SHA256,
     MODEL_PATH,
     TOLERANCES,
     capture,
@@ -27,8 +28,6 @@ from support import (
     time_graph,
     torch_mix,
 )
-
-BASELINE_COMMIT = "8cf5501b6913f57a2e7c8dcee52b625fc8ab23c3"
 
 
 def choose_config(rows, buckets):
@@ -49,6 +48,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rows", nargs="+", type=int, default=list(range(1, 25)))
     parser.add_argument("--weights", type=int, default=100)
+    parser.add_argument("--model-path", type=Path, default=MODEL_PATH)
+    parser.add_argument("--triton-kernel", type=Path, default=BASELINE_PATH)
     parser.add_argument("--seed", type=int, default=101)
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--samples", type=int, default=7)
@@ -62,24 +63,24 @@ def main():
         raise ValueError("benchmark rows must be 1..24")
     if min(args.weights, args.rounds, args.samples, args.replays, args.graph_repeats) < 1:
         raise ValueError("benchmark counts must be positive")
-    source = subprocess.check_output(
-        [
-            "git",
-            "-C",
-            "/opt/sglang",
-            "show",
-            f"{BASELINE_COMMIT}:python/sglang/srt/layers/hc_mix_triton.py",
-        ]
-    )
-    if source != BASELINE_PATH.read_bytes():
-        raise RuntimeError("working-tree Triton baseline differs from requested commit")
+    if not (args.model_path / "model.safetensors.index.json").is_file():
+        parser.error(f"checkpoint index not found under {args.model_path}; set --model-path to the model directory")
+    if not args.triton_kernel.is_file():
+        parser.error(
+            f"Triton source not found: {args.triton_kernel}; restore baselines/hc_mix_triton.py or set --triton-kernel"
+        )
+    source = args.triton_kernel.read_bytes()
+    if hashlib.sha256(source).hexdigest() != BASELINE_SHA256:
+        parser.error(
+            f"Triton source {args.triton_kernel} differs from the verified 8cf5501b baseline; use the bundled copy"
+        )
     with args.configs.open() as f:
         buckets = json.load(f)["buckets"]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch._dynamo.config.recompile_limit = 64
     torch._dynamo.config.fail_on_recompile_limit_hit = True
     torch_compiled = torch.compile(torch_mix, dynamic=False, fullgraph=True)
-    baseline = load_triton_baseline()
+    baseline = load_triton_baseline(args.triton_kernel)
     previous = load_flydsl_baseline(args.previous_kernel) if args.previous_kernel else None
     rng = random.Random(args.seed)
     generator = torch.Generator(device="cuda").manual_seed(args.seed)
@@ -98,8 +99,9 @@ def main():
             "triton": triton.__version__,
             "dtype": "bfloat16",
             "baseline_commit": BASELINE_COMMIT,
+            "baseline_source": str(args.triton_kernel),
             "baseline_sha256": hashlib.sha256(source).hexdigest(),
-            "model_path": str(MODEL_PATH),
+            "model_path": str(args.model_path),
             "seed": args.seed,
             "configurations": buckets,
             "rounds": args.rounds,
@@ -114,12 +116,12 @@ def main():
             metadata["previous_flydsl_source"] = str(args.previous_kernel)
             metadata["previous_flydsl_sha256"] = hashlib.sha256(previous_source).hexdigest()
             args.output.with_name(args.output.stem + ".previous_kernel.py").write_bytes(previous_source)
-        for name in ("kernel.py", "support.py", "benchmark.py"):
-            content = Path(__file__).with_name(name).read_bytes()
+        for name in ("kernel.py", "support.py", "benchmark.py", "hc_mix_triton.py"):
+            content = source if name == "hc_mix_triton.py" else Path(__file__).with_name(name).read_bytes()
             destination = args.output.with_name(args.output.stem + "." + name)
             destination.write_bytes(content)
             metadata[name + "_sha256"] = hashlib.sha256(content).hexdigest()
-        pairs = list(checkpoint_pairs(limit=args.weights))
+        pairs = list(checkpoint_pairs(limit=args.weights, model_path=args.model_path))
         if len(pairs) != args.weights:
             raise RuntimeError(f"requested {args.weights} pairs, found {len(pairs)}")
         metadata["weight_names"] = [p[0] for p in pairs]
