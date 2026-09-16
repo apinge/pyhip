@@ -180,16 +180,27 @@ launch uses the current stream at invocation time, including the capture stream.
 The reference and benchmark input generators use actual checkpoint weights with
 synthetic normalized inputs, not recorded model activations.
 
-To repeat the E38 optimized comparison, use a new output filename:
+To benchmark the optimized entry and current comparison backends, print results
+directly. No output file, previous result directory or V1 snapshot is required:
 
 ```bash
 HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
   python3 bench_three_stage.py \
   --rows 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 \
   --weights 100 --rounds 3 --samples 7 --combined-host --baselines \
-  --prefetch-kernel ./prefetch_up.py --hidden-pad 4 --reduce-threads 128 --reduce-vec 1 \
-  --output /opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/new_optimized_full_checkpoint.jsonl
+  --prefetch-kernel ./prefetch_up.py --hidden-pad 4 --reduce-threads 128 --reduce-vec 1
 ```
+
+Results print as a table with Graph and Eager wall medians in us per complete
+GR read. Add `--output /path/to/new_results.jsonl` only when JSONL samples,
+metadata and source snapshots are needed; existing files are never overwritten.
+
+The optional `--previous-kernel /path/to/v1_kernel.py` adds an earlier `GRRead`
+implementation as the `v1` backend. It loads Python source, reruns that kernel in
+the same benchmark, and records a source snapshot when `--output` is supplied;
+it never reads old timing data.
+To reproduce the original E38 backend set, explicitly pass the preserved
+`e10_full_checkpoint_compensated.kernel.py` snapshot with this option.
 
 The eager measurements include the ordinary Python/runtime submission path and
 batch-boundary synchronization. They are not pure hardware launch-cost measurements
