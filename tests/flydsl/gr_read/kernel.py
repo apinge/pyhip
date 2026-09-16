@@ -326,8 +326,8 @@ def _launchers(rows: int, dtype: torch.dtype, config: Config):
         if fx.const_expr(down_mode == "wave_splitk"):
             down_wave_splitk_silu(X, W, P).launch(
                 grid=(padded_rows // bm, R // dn, 1), block=(down_waves * 64, 1, 1), stream=stream
-            )
-        else:
+            ) 
+        else: # R/dn=320/64=5, N方向5份，split 16 , K(10240)/split=640 m每个workgroup只操作640个K ，padded_rows//bm=1 (只有1~16走这个kernel) 这样N*K正好80个CU
             down_partial(X, W, P).launch(grid=(padded_rows // bm, R // dn, split), block=(threads, 1, 1), stream=stream)
 
     @flyc.jit

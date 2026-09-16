@@ -2,6 +2,28 @@
 
 Standalone FlyDSL experiment. No SGLang production dispatch is changed.
 
+## Review and Debug Start Here
+
+The final path is `CombinedPaddedGRRead` -> `_padded_pair_launcher` ->
+`prefetch_up._launchers` -> one selected down kernel and `up_gate`.
+Construction chooses the T bucket; a prepared reader does not change T at call time.
+
+For a final-entry-only example with explicit inputs, FP64 reference, intermediate
+checks and an optional breakpoint:
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 test_final_entry.py --rows 1 17 --graph
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 test_final_entry.py --rows 17 --debug
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 test_final_entry.py --graph --check-contract
+```
+
+Unlike the older pytest-only files, `test_final_entry.py` is a plain Python script
+using `assert torch.allclose(...)`, with no pytest dependency. By default it checks
+T=1/16/17/24; `--graph` adds replay checks for the selected rows and
+`--check-contract` adds empty/invalid input checks. This is not the full checkpoint
+acceptance suite, and its synchronized stage checks are not performance measurements.
+See the [call-chain and manual-test guide](/opt/qwen3.8-flash-next-doc/22-GR_read_最终版调用链与手写单测_2026-09-14.md).
+
 ## Latest Optimized Entry
 
 `CombinedPaddedGRRead` in `combined_host.py` is the latest validated standalone
@@ -73,6 +95,7 @@ validated LDS padding and host submission options itself.
 | --- | --- |
 | `kernel.py` | FlyDSL kernels, preparation, shape/device guards, fixed configuration |
 | `test_gr_read.py` | BF16 correctness, graph replay, cache-key isolation, recorded rounding regression |
+| `test_final_entry.py` | Plain Python final-entry checks with `assert torch.allclose`, graph replay and `--debug` |
 | `support.py` | FP64 reference, exact local Triton baseline, checkpoint loading and timing |
 | `benchmark.py` | All 100 checkpoint pairs, all 24 row counts, randomized order, optional previous FlyDSL baseline |
 | `selected_configs.json` | Accepted per-row configurations with activation compensation enabled |
