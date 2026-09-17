@@ -12,3 +12,18 @@ This source is licensed under Apache-2.0; the upstream license is included in
 `LICENSE`. It is benchmark source, not historical timing data. Do not reformat
 or retune this frozen baseline. Its `fused_hc_mix` entry needs Torch and Triton,
 not a SGLang checkout or installation. No SGLang production dispatch is changed.
+
+## Three-stage Comparison: 626c6413
+
+`hc_mix_triton_626c6413.py` is a separate, unmodified upstream snapshot:
+
+https://github.com/sgl-project/sglang/blob/626c64132d7f197de2053232264aeabb37ad156b/python/sglang/srt/layers/hc_mix_triton.py
+
+- Git blob: `c7e66d57de0faab54a20469529127dee4da29d14`.
+- SHA256: `4a36c9cb92cfcccdd2232ffa6e3a9a5c086361c03d7f30fc3c83bd653739a394`.
+- The same upstream Apache-2.0 `LICENSE` applies.
+- This snapshot replaces the persistent barrier kernel with down/reduce/up
+  launches and stores the SiLU activation in the input dtype (BF16 in our test).
+
+Use `bench_compare_626c6413.py` for a matched full-call CUDA Graph comparison.
+It does not replace `hc_mix_triton.py`, the existing baseline, or SGLang code.

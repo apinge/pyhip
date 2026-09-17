@@ -2,6 +2,30 @@
 
 Standalone FlyDSL experiment. No SGLang production dispatch is changed.
 
+## Graph Comparison with Colleague 626c6413
+
+For the requested T1..16 comparison, this single command runs both our selected
+two-kernel path and the colleague's unmodified three-stage Triton wrapper.
+No model, SGLang installation, output file, or historical results are required:
+
+```bash
+cd /opt/pyhip/tests/flydsl/gr_read
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+python3 bench_compare_626c6413.py --synthetic --rows {1..16} \
+  --weights 100 --rounds 3 --samples 7 --seed 101
+```
+
+Read `Graph us` for `flydsl_selected` and `triton_626c6413`. Both are full-call
+CUDA Graph replay times, not summed stage timings or eager wall time. Replace
+`--synthetic` with `--model-path /path/to/checkpoint` for real HC weights;
+`--output /tmp/compare_new.jsonl` optionally records raw samples and snapshots.
+The upstream source is pinned separately under `baselines/`, with its license
+and hash; the existing persistent Triton baseline is not replaced.
+
+On the recorded MI308X run, ours was faster at T1..7 (T7 nearly tied), while
+the colleague's three-stage path was faster at T8..16. Full tables and method:
+[comparison report](/opt/qwen3.8-flash-next-doc/31-GR_read_626c6413三段与当前FlyDSL_CUDAGraph对比_2026-09-17.md).
+
 ## Review and Debug Start Here
 
 The original/default path is `CombinedPaddedGRRead` -> `_padded_pair_launcher` ->
