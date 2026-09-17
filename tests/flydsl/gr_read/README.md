@@ -10,6 +10,10 @@ Construction chooses the T bucket; a prepared reader does not change T at call t
 The newer opt-in T=17..32 path is `LargeDownGRRead` in `large_down.py`;
 it does not replace this default. See [Accuracy Validation](#accuracy-validation)
 for separate commands testing both paths.
+For weight preparation, scratch allocation, and graph lifetime rules, see
+[Weight and Workspace Interface](#weight-and-workspace-interface).
+A short [Chinese algorithm overview](/opt/qwen3.8-flash-next-doc/30-GR_read_当前算法简述_2026-09-17.md)
+describes the selected small-T and large-T paths.
 
 For a final-entry-only example with explicit inputs, FP64 reference, intermediate
 checks and an optional breakpoint:
@@ -93,6 +97,236 @@ intermediate rounding and does not pass the complete acceptance dataset.
 `kernel.GRRead(rows, wd, wu)` selects the E17 reference configuration. Explicit
 `Config(...)` arguments are experimental. The optimized entry above fixes the
 validated LDS padding and host submission options itself.
+
+## Weight and Workspace Interface
+
+This section describes the **current selected paths**: `CombinedPaddedGRRead`
+for T=1..16 and `LargeDownGRRead` for T=17..32. The old large-T control is listed
+separately because its intermediate has different semantics. These are
+inference-only interfaces; no autograd or automatic weight-update propagation
+is implemented.
+
+### Public Preparation: Pass Original Weights
+
+The fixed model dimensions are `C=4, H=2560, K=C*H=10240, R=320`. All tensors
+must be on the same ROCm device. Use the complete local matrices below; do not
+halve their dimensions just because the surrounding framework uses TP=2.
+
+| Argument | Required logical shape and dtype | Meaning |
+| --- | --- | --- |
+| `x` | contiguous BF16 `[T,10240]` | Already normalized input; element `(t,c,h)` is `x[t,c*H+h]` |
+| `w_down` | BF16 `[320,10240]` | Original linear weight `[output,input]`, not transposed or packed |
+| `w_up` | BF16 `[10240,320]` | Original stream-major output rows, row index `c*H+h` |
+| Returned `y` | contiguous BF16 `[T,2560]` | Natural hidden-channel order `h`; no output unshuffle needed |
+
+Given valid `x`, `w_down`, and `w_up`, prepare once outside the forward loop:
+
+```python
+import torch
+from combined_host import CombinedPaddedGRRead
+from large_down import LargeDownGRRead
+
+T = x.shape[0]
+with torch.cuda.device(x.device), torch.inference_mode():
+    prepared = CombinedPaddedGRRead(T, w_down, w_up)
+    reader = LargeDownGRRead(prepared) if T > 16 else prepared
+    y = reader(x)
+```
+
+`CombinedPaddedGRRead` performs all reorder/preshuffle work and allocates its
+workspace/output in its constructor. `LargeDownGRRead(prepared)` reuses exactly
+`prepared.w_down` and `prepared.w_up`, but allocates separate P/Y buffers.
+It does not preshuffle again. No caller-created scratch is needed with this API.
+
+**Do not pass packed or already-reordered weights to the public constructor.**
+There is no `from_packed`, `packed=True`, `out=`, or `workspace=` public argument.
+Reshaping a packed flat tensor back to the original dimensions does not restore
+its logical values; the constructor would pack it again and compute the wrong
+result. In particular, an already-interleaved W_up has the same 2D shape as the
+original, so shape checking cannot detect this mistake.
+
+T is fixed when preparing a reader. Even T25 and T32, whose internal padded row
+count is the same, require matching row specializations. If a framework pads
+25 requests to a physical `x[32,10240]`, prepare T=32 and use U1. If `x` really
+has 25 rows, prepare T=25 and use U2. Do not externally pad X just to satisfy an
+internal scratch size. Zero rows are handled only by the original entry;
+`LargeDownGRRead` requires 17..32 and raw dispatch must not be called for T=0.
+
+### Exact Packed Weight Format
+
+The following reproduces the public constructor's preparation. Use it to
+inspect the format or supply already-packed tensors to the **low-level**
+dispatch below, not as input to `CombinedPaddedGRRead`:
+
+```python
+from prefetch_up import preshuffle_weight
+
+C, H, R = 4, 2560, 320
+K = C * H
+with torch.cuda.device(w_down.device), torch.inference_mode():
+    WU_hc = w_up.reshape(C, H, R).permute(1, 0, 2).contiguous().reshape(K, R)
+    WD_packed = preshuffle_weight(w_down)
+    WU_packed = preshuffle_weight(WU_hc)
+```
+
+There are two distinct layout operations:
+
+1. **Only W_up gets a logical row reorder:**
+   `WU_hc[h*C+c, r] = w_up[c*H+h, r]`. W_down's logical input columns and X
+   stay in `c*H+h` order.
+2. **Both weights get physical preshuffle.** For a logical `W[N,K_in]`, the
+   helper is exactly
+   `W.reshape(N//16,16,K_in//32,4,8).permute(0,2,3,1,4).contiguous().view(-1)`.
+
+In the resulting 5D storage,
+`packed[n//16,k//32,(k//8)%4,n%16,k%8] == W[n,k]`.
+For W_up, `W` in this equation is `WU_hc`, not the original stream-major weight.
+
+| Packed tensor | 5D storage shape before flattening | Passed to launcher as | Size |
+| --- | --- | --- | --- |
+| `WD_packed` | `[20,320,4,16,8]` | contiguous BF16 `[3276800]` | 6,553,600 bytes |
+| `WU_packed` | `[640,10,4,16,8]` | contiguous BF16 `[3276800]` | 6,553,600 bytes |
+
+This is a permutation, not quantization or scaling. The format is identical
+for small T, U1, and U2; it does not depend on global split-K. Do not reorder X.
+The up epilogue already pairs interleaved `logits[t,h*C+c]` with the original
+`x[t,c*H+h]` before summing over C. A flat elementwise multiply of these two
+different `[T,10240]` orders would be wrong outside that epilogue.
+
+Pack once per layer/weight pair, device, and weight version. The public
+constructor packs once **per reader construction**, not automatically once
+across every T-specific reader. Cross-T packed-weight caching is a caller
+responsibility if using the low-level interface. Changing the original model
+weights after preparation does not refresh these packed copies: rebuild/repack
+and update any affected graph capture. FP64 reference checks still take the
+original unpacked weights.
+
+### Intermediate Buffer: Shape, Stride, and Meaning
+
+P is always a contiguous **FP32 flat tensor** at the launcher boundary.
+Its useful debug view depends on the selected path:
+
+| Path | T | Debug view of P | FP32 elements / bytes | What down writes |
+| --- | --- | --- | --- | --- |
+| Selected small T | 1..16 | `[16,16,320]` | 81,920 / 327,680 (320 KiB) | 16 linear K partials, before `/4` and SiLU |
+| Selected large T, U1/U2 | 17..32 | `[4,32,320]` | 40,960 / 163,840 (160 KiB) | 4 linear K partials, already reduced across the 4 waves within each CTA |
+| Old large-T `CombinedPaddedGRRead` control | 17..32 | `[32,320]` | 10,240 / 40,960 (40 KiB) | Completed FP32 `silu((X @ W_down.T)/4)` |
+
+For linear partials, the external view is **`[split,T_pad,R]`**, with element
+offset `(split_index*T_pad + row)*R + rank`. The FlyDSL source expresses the
+same storage as shape `(T_pad,R,split)` with strides `(R,1,T_pad*R)`; that does
+not mean a contiguous Torch `[T_pad,R,split]` view has the right meaning.
+
+Each small-T global split covers 640 K elements. Each selected large-T global
+split covers 2560 K elements, internally divided among four waves. Thus
+`P.view(S,T_pad,R).sum(0)[:T]` is the linear down result, before `/4` and SiLU.
+Do not apply SiLU independently to each split. Up performs the complete
+reduction, `/4`, SiLU, high/low conversion, and up GEMM in the second kernel.
+
+The member name `reader.partial` alone does **not** identify its semantics:
+the old large-T control stores an activated result there. Experimental
+`LargeDownGRRead(..., DownConfig(global_split=1, ...))` also stores a completed
+activation in `[32,320]`; global split=2 stores linear partials in `[2,32,320]`.
+Do not mix P from one path with another path's compiled up kernel.
+
+For selected paths, T_pad=16 at T<=16 and T_pad=32 at T>=17. T=1 still needs
+the full 320 KiB P allocation, and T=17 still needs 160 KiB. Y is only `[T,H]`,
+not `[T_pad,H]`. For other experimental configurations, derive the dimensions
+from that configuration rather than reusing this selected-path table.
+
+**No zero-initialization is required before a full down+up call.** Down
+overwrites the P values used by up, including zero padded rows for finite
+inputs/weights. `torch.empty` is sufficient. Up must never run first or read
+partials from a previous input. These FlyDSL paths need no global counter
+buffer. The BF16 high/low activation arrays, logits, and `hidden_pad=4` live
+inside GPU LDS; callers do not allocate them. In particular, P's rank stride
+is **320, not 324**.
+
+### Caller-Owned Buffers: Current Low-Level Interface
+
+The already compiled handles expose the following Python call signatures for
+positive T. These are current internal interfaces, not a stable production C ABI:
+
+```text
+reader.down(X_flat, WD_packed, P_flat, stream)
+reader.up(X_flat, WU_packed, P_flat, Y_flat, stream)
+reader.dispatch(X_flat, WD_packed, WU_packed, P_flat, Y_flat, stream)
+```
+
+For the **selected reader prepared above**, the following uses explicit P/Y
+and the separately packed weights above, without changing any kernel:
+
+```python
+S, T_pad = (16, 16) if T <= 16 else (4, 32)
+P = torch.empty(S * T_pad * R, dtype=torch.float32, device=x.device)
+Y = torch.empty((T, H), dtype=torch.bfloat16, device=x.device)
+with torch.cuda.device(x.device), torch.inference_mode():
+    reader.dispatch(
+        x.view(-1), WD_packed, WU_packed, P, Y.view(-1),
+        torch.cuda.current_stream(x.device),
+    )
+```
+
+Read the result from **Y**, not `reader.output`: explicit dispatch does not
+rebind the reader's owned buffers. Likewise, `reader.run_down(x)` and
+`reader.run_up(x)` use `reader.partial`, not the external P above. If manually
+launching the two compiled handles, pass the same P and the same X values to
+both stages, with down ordered before up.
+
+All flat arguments must match the prepared dtype, element count, contiguous
+layout, and device. Use normal Torch allocations; a custom suballocator must
+preserve vector-copy alignment (use at least 16-byte-aligned base addresses).
+Writable P/Y storage must not overlap each other or X/weights. The low-level
+handles do not perform all of the public wrapper's input checks. Do not reuse
+a compiled entry for another T/config just because buffer byte sizes happen
+to match. To prepare directly from cached packed weights without a temporary
+public reader, the internal launcher factories require explicit matching
+down/up configs and `flydsl.compiler.compile`; no public packed-weight factory
+is currently provided.
+
+### Lifetime, Streams, and Graph Capture
+
+- Each reader owns mutable P/Y; its output is overwritten by the next call.
+  Schedule `y.clone()` before reusing the reader if an earlier result must be
+  retained. Returning from a call does not synchronize the GPU.
+- Read-only packed weights may be shared. Concurrent executions need separate
+  P/Y buffers and correctly ordered input/output dependencies. Do not overlap
+  calls that write the same reader workspace, even from different streams.
+- Prepare, compile, allocate, and warm up before capture. Use the correct
+  device context and current stream; producer work on another stream needs an
+  explicit event/wait dependency. The wrapper does not add those waits for you.
+- Keep the reader, packed weights, X, P, Y, and compiled handles alive while GPU
+  work or a captured graph may access them. Graphs retain captured addresses;
+  assigning a different Python tensor to an attribute does not retarget them.
+- Use the stream active **inside** the capture context. Do not pass a stale
+  stream saved before entering `torch.cuda.graph`. Public `reader(x)` obtains
+  the current stream at each call.
+
+For a prepared reader and a new `next_x` of exactly the same shape/dtype/device:
+
+```python
+with torch.cuda.device(x.device), torch.inference_mode():
+    static_x = torch.empty_like(x)
+    static_x.copy_(x)
+    for _ in range(3):
+        reader(static_x)
+    torch.cuda.synchronize(x.device)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        static_y = reader(static_x)
+    static_x.copy_(next_x)
+    graph.replay()
+```
+
+Consume `static_y` with the same-stream ordering or explicit synchronization.
+For the explicit-buffer interface, capture `reader.dispatch(...)` with the
+external P/Y and read that Y; the same address-lifetime rules apply.
+
+The four Python examples in this interface section were executed on gfx942
+with synthetic BF16 inputs at T=1/16/17/25/26/32. Exact packed-weight equality,
+external P/Y dispatch, poisoned-workspace overwrite, padded rows, and
+changed-input replay for both reader-owned and external buffers passed.
+This validates the examples on gfx942, not a new gfx950 or performance result.
 
 ## Accuracy Validation
 
