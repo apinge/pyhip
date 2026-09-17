@@ -12,6 +12,7 @@ Ordinary and persistent grids share this body and public tensor layouts.
 
 import functools
 import math
+import warnings
 
 import torch
 import flydsl.compiler as flyc
@@ -902,12 +903,18 @@ class _PagedAttention:
             raise ValueError("causal must match the factory; return_lse must be bool")
         if sink_ptr is not None:
             raise NotImplementedError("gfx942 BF16 full MHA does not support sinks")
-        if not isinstance(Q, torch.Tensor) or not Q.is_cuda:
-            raise ValueError("Q/K/V must be tensors on the same gfx942 GPU")
+        if not isinstance(Q, torch.Tensor) or not Q.is_cuda or torch.version.hip is None:
+            raise ValueError("Q/K/V must be tensors on the same ROCm GPU")
         device = Q.device
         properties = torch.cuda.get_device_properties(device)
-        if getattr(properties, "gcnArchName", "").split(":", 1)[0] != "gfx942":
-            raise NotImplementedError("this BF16 backend requires gfx942")
+        arch = getattr(properties, "gcnArchName", "unknown")
+        if arch.split(":", 1)[0] != "gfx942":
+            warnings.warn(
+                f"This BF16 attention backend was validated on gfx942, not {arch}; "
+                "check accuracy before using the results.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         for name, tensor in (("Q", Q), ("K", K), ("V", V)):
             if not isinstance(tensor, torch.Tensor) or tensor.device != device:
                 raise ValueError(f"{name} must be a tensor on the input GPU")

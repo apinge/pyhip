@@ -1,5 +1,7 @@
 """Opt-in ROWS=32 probe of the unchanged tuned Triton kernel, not production dispatch."""
 
+import warnings
+
 import torch
 
 
@@ -19,7 +21,13 @@ class ExtendedTritonGRRead:
             raise ValueError("weights must be contiguous")
         props = torch.cuda.get_device_properties(w_down.device)
         if props.gcnArchName.split(":", 1)[0] != "gfx942" or props.multi_processor_count != 80:
-            raise ValueError("extended Triton experiment requires an 80-CU gfx942 device")
+            warnings.warn(
+                "Extended Triton was tuned on an 80-CU gfx942 device; "
+                f"running on {props.gcnArchName} with {props.multi_processor_count} CUs. "
+                "The fixed 80-CTA launch is unchanged and has not been validated on this device.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.rows, self.device = rows, w_down.device
         self.options = dict(baseline._GFX942_MIX_CONFIG, ROWS=32, HC=4)
         self.kernel = baseline._hc_mix_persistent_kernel

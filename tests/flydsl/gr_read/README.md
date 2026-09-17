@@ -57,7 +57,9 @@ and [raw E38 results](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/e38_opt
 
 ## Contract
 
-- GPU: MI308X / gfx942. Measured with 80 compute units.
+- Validated GPU: MI308X / gfx942, measured with 80 compute units. Other ROCm
+  architectures (including gfx950) emit `RuntimeWarning` and continue for
+  review/testing; this is not a claim of validated cross-architecture correctness.
 - Input: contiguous BF16 normalized residual `X[T,10240]`, `1 <= T <= 32`.
 - Original weights: BF16 `W_down[320,10240]`, `W_up[10240,320]`.
 - Output: BF16 `Y[T,2560]`. Zero rows return an empty output; rows above 32 are rejected.
@@ -96,7 +98,8 @@ validated LDS padding and host submission options itself.
 
 Run the following commands in **Bash**, from this directory. `{1..32}` expands
 to all 32 row counts; `{17..32}` expands to all 16 large-T row counts. Select an
-idle gfx942 GPU. Synthetic checks do not need SGLang or a model checkpoint.
+idle ROCm GPU; the recorded results below are from gfx942. Synthetic checks
+do not need SGLang or a model checkpoint.
 
 ```bash
 cd /opt/pyhip/tests/flydsl/gr_read
@@ -225,10 +228,12 @@ not the supported SGLang T<=16 wrapper and is not selected FlyDSL:
 python3 test_extended_triton.py --rows {17..32}
 python3 test_benchmark_paths.py
 python3 test_bandwidth.py
+python3 test_architecture_warnings.py
 ```
 
-The last two checks are CPU-only: bundled source hash / CLI paths and byte-count
-units, respectively. They do not prove GPU numerical correctness.
+The last three checks are CPU-only: bundled source hash / CLI paths, byte-count
+units, and architecture-warning contracts using mocked device properties.
+They do not prove GPU numerical correctness or actual gfx950 compilation.
 
 When benchmark flags `--baselines` or `--torch-baseline` are enabled, baseline
 accuracy failures are recorded without aborting; an exit code of zero does
@@ -269,6 +274,7 @@ checkpoint benchmark rerun during this pre-commit check.
 | `test_benchmark_paths.py` | Plain Python CPU checks for bundled baseline, loader cache and configurable input paths |
 | `bench_bandwidth.py` | Final `combined_padded` T=1..32 graph timing and logical effective bandwidth; no model required by default |
 | `test_bandwidth.py` | CPU-only byte-count and cudaPerf-compatible GB/s conversion checks |
+| `test_architecture_warnings.py` | CPU-only mock checks: gfx950 warnings, native gfx942 silence, unchanged hard input/resource guards |
 | `benchmark.py` | Checkpoint correctness and matched timings; supports rows through 32 and optional previous FlyDSL baseline |
 | `experimental_triton.py` | Opt-in ROWS=32 probe of the original tuned Triton kernel; not its production wrapper |
 | `test_extended_triton.py` | Plain Python FP64, changed-input graph and barrier-counter checks for the Triton extension |
@@ -293,6 +299,24 @@ checkpoint benchmark rerun during this pre-commit check.
 
 Validated with FlyDSL 0.3.1, PyTorch 2.12.0+ROCm 7.2.4, Triton 3.7.1, Python 3.10.
 The machine already has the required packages. FlyDSL was not upgraded.
+
+### Reviewing on gfx950
+
+GR read's `kernel.GRRead` and `prefetch_up.GRRead` now warn rather than reject
+other ROCm architectures. This also covers `CombinedPaddedGRRead` and
+`LargeDownGRRead`. No weight reorder, preshuffle, tile selection, accumulation,
+or high/low compensation changed. Shape, BF16, ROCm-device, and the existing
+64 KiB LDS configuration checks remain hard errors.
+
+Compile the source on the target GPU; do not force `ARCH=gfx942` or assume a
+previously generated gfx942 HSACO can be loaded on gfx950. First run the plain
+Python FP64/replay checks above. The architecture warning is advisory; actual
+compiler/runtime instruction errors and numerical mismatches remain failures.
+
+The opt-in `experimental_triton.py` also warns on a non-80-CU/gfx942 device;
+it keeps its fixed 80-CTA launch and original tuning. This is for review, not a
+retuned gfx950 baseline. The bundled `baselines/hc_mix_triton.py` source/hash
+is unchanged and retains its original architecture-dependent dispatch.
 
 Run commands from this directory and select an available physical GPU. GPU 2 was
 used for the recorded experiment.

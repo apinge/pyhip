@@ -1,5 +1,6 @@
 import functools
 import os
+import warnings
 
 os.environ.setdefault("FLYDSL_RUNTIME_ENABLE_CACHE", "0")
 
@@ -1128,7 +1129,14 @@ def MHA(
         assert cu_seqlens_q.shape == cu_seqlens_k.shape == kv_indptr.shape
         assert kv_last_page_lens.shape[0] == cu_seqlens_q.shape[0] - 1
         assert k.numel() * k.element_size() <= 2**31 - 1
-        assert "gfx942" in torch.cuda.get_device_properties().gcnArchName
+        arch = torch.cuda.get_device_properties().gcnArchName
+        if "gfx942" not in arch:
+            warnings.warn(
+                f"This paged-attention kernel was validated on gfx942, not {arch}; "
+                "check accuracy before using the results.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         batch_size = cu_seqlens_q.shape[0] - 1
         static_schedule = batch_size == 1
         if static_schedule:

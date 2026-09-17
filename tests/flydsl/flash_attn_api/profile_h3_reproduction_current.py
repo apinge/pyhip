@@ -22,6 +22,7 @@ import sys
 import tempfile
 import threading
 import time
+import warnings
 from pathlib import Path
 
 os.environ.setdefault("AITER_AOT_IMPORT", "1")
@@ -754,9 +755,12 @@ def main():
     torch.set_grad_enabled(False)
     properties = torch.cuda.get_device_properties(torch.cuda.current_device())
     if "gfx942" not in properties.gcnArchName or properties.multi_processor_count != 80:
-        raise RuntimeError(
-            f"expected 80-CU gfx942, got {properties.gcnArchName} "
-            f"with {properties.multi_processor_count} CUs"
+        warnings.warn(
+            f"This reproduction targets an 80-CU gfx942, got {properties.gcnArchName} "
+            f"with {properties.multi_processor_count} CUs. Results are not directly comparable; "
+            "external gfx942 code objects require a compatible rebuild.",
+            RuntimeWarning,
+            stacklevel=2,
         )
 
     flydsl_names = {"new_flydsl_4wave", "new_flydsl_8wave"}

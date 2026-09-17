@@ -8,6 +8,7 @@ import os
 import random
 import re
 import statistics
+import warnings
 from pathlib import Path
 from typing import Any, cast
 
@@ -444,7 +445,12 @@ def run_benchmark(args):
     torch.cuda.set_device(args.device)
     properties = torch.cuda.get_device_properties(args.device)
     if "gfx942" not in properties.gcnArchName:
-        raise RuntimeError(f"该工具只在gfx942验证，实际为{properties.gcnArchName}")
+        warnings.warn(
+            f"This bandwidth tool was validated on gfx942, not {properties.gcnArchName}; "
+            "instruction and cache-policy behavior may differ.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     args.grid_blocks = properties.multi_processor_count if args.grid_blocks is None else args.grid_blocks
     if not 1 <= args.grid_blocks <= properties.multi_processor_count:
         raise ValueError(f"--grid-blocks必须在1..{properties.multi_processor_count}")

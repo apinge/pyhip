@@ -8,6 +8,7 @@ LDS-transpose instructions, or native FP32-to-BF16 conversion.
 
 import functools
 import math
+import warnings
 
 import torch
 import flydsl.compiler as flyc
@@ -632,8 +633,16 @@ class _PagedAttention:
         last-page lengths and maximum lengths must describe the current input;
         they are never synchronized back to the host. Warm before graph capture.
         """
-        if not Q.is_cuda or "gfx942" not in torch.cuda.get_device_properties(Q.device).gcnArchName:
-            raise NotImplementedError("this public kernel requires gfx942; use the separate cross-compile validation harness elsewhere")
+        if not Q.is_cuda or torch.version.hip is None:
+            raise NotImplementedError("this FP8 attention backend requires a ROCm GPU")
+        arch = torch.cuda.get_device_properties(Q.device).gcnArchName
+        if "gfx942" not in arch:
+            warnings.warn(
+                f"This FP8-FNUZ attention backend was validated on gfx942, not {arch}; "
+                "native FP8 formats and instruction support may differ. Check accuracy before use.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         if Q.dtype != torch.float8_e4m3fnuz or K.dtype != Q.dtype or V.dtype != Q.dtype:
             raise NotImplementedError("gfx942 native FP8 E4M3FNUZ Q/K/V only")
         if causal != self.causal or sink_ptr is not None:

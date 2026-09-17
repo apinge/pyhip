@@ -9,6 +9,7 @@ full checkpoint passes the existing FP64 tolerance without changing weights.
 
 from dataclasses import dataclass
 from functools import cache
+import warnings
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -366,7 +367,12 @@ class GRRead:
             raise ValueError("weights must be on the same ROCm device")
         props = torch.cuda.get_device_properties(w_down.device)
         if props.gcnArchName.split(":", 1)[0] != "gfx942":
-            raise ValueError("this experiment targets gfx942")
+            warnings.warn(
+                f"GR read was tuned on gfx942; running on {props.gcnArchName} "
+                "without architecture-specific validation. Check accuracy before using the results.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         self.rows, self.config, self.dtype, self.device = rows, config, w_down.dtype, w_down.device
         up_interleaved = w_up.reshape(HC, HS, R).permute(1, 0, 2).contiguous().reshape(K, R)
         if config.preshuffle:
