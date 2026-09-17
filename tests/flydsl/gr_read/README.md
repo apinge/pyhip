@@ -49,7 +49,7 @@ old driver's `--baselines` or `--combined-host` flags.
 
 | Script / T | Read this row, Full graph column | Other rows |
 | --- | --- | --- |
-| small, 1..16 | `ours_optimized` | `frozen` is old FlyDSL; `colleague_626c6413` is three-stage Triton |
+| small, 1..16 | `ours_optimized` | `frozen` is old FlyDSL; `triton3stage` is three-stage Triton from commit 626c6413 |
 | large, 17..25 | `m32_k128_w4_pf1_i1_s4_u2` | `control` is old FlyDSL; optional `torch_compile` |
 | large, 26..32 | `m32_k128_w4_pf1_i1_s4` | Same controls; no suffix means U1, not no prefetch |
 

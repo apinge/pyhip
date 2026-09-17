@@ -113,7 +113,7 @@ def main():
             xs = [torch.randn(rows, 10240, device="cuda", dtype=torch.bfloat16, generator=generator) for _ in pairs]
             refs = [reference(x, wd, wu) for x, (_, wd, wu) in zip(xs, pairs)]
             controls = [CombinedPaddedGRRead(rows, wd, wu) for _, wd, wu in pairs]
-            groups = {"frozen": controls, "colleague_626c6413": [ColleagueReader(upstream, wd, wu) for _, wd, wu in pairs]}
+            groups = {"frozen": controls, "triton3stage": [ColleagueReader(upstream, wd, wu) for _, wd, wu in pairs]}
             for cfg in ([default_config(rows)] if args.selected else configs):
                 name = "ours_optimized" if args.selected else cfg.name
                 groups[name] = [SmallBatchGRRead(control, cfg) for control in controls]
@@ -123,7 +123,7 @@ def main():
                     if isinstance(reader, SmallBatchGRRead):
                         assert reader.w_down.data_ptr() == control.w_down.data_ptr()
                         assert reader.w_up.data_ptr() == control.w_up.data_ptr()
-                for stage in (("full", "down", "up") if args.stages and name != "colleague_626c6413" else ("full",)):
+                for stage in (("full", "down", "up") if args.stages and name != "triton3stage" else ("full",)):
                     calls = [lambda r=r, x=x, s=stage: r(x) if s == "full" else getattr(r, "run_" + s)(x)
                              for r, x in zip(group, xs)]
                     key = (name, stage)
@@ -133,7 +133,7 @@ def main():
                         outputs[name] = [r.output for r in group]
                         graphs[key].replay()
                         checks[name] = {"initial": verify(outputs[name], refs, names)}
-                        if name != "colleague_626c6413":
+                        if name != "triton3stage":
                             assert not checks[name]["initial"]["failures"], checks[name]
                 eager[name] = []
             for _ in range(args.rounds):
@@ -155,13 +155,13 @@ def main():
                 for _ in range(20):
                     graphs[(name, "full")].replay()
                 checks[name]["changed"] = verify(outputs[name], refs, names)
-                if name != "colleague_626c6413":
+                if name != "triton3stage":
                     assert not checks[name]["changed"]["failures"], checks[name]
                 medians = {s: statistics.median(v for r in timings[(name, s)] for v in r["samples_us"])
                            for s in ("full", "down", "up") if (name, s) in timings}
                 wall = statistics.median(v for r in eager[name] for v in r["wall_samples_us"]) if args.eager else None
                 emit({"type": "result", "rows": rows, "backend": name,
-                      "config": asdict(group[0].config) if name != "colleague_626c6413" else None,
+                      "config": asdict(group[0].config) if name != "triton3stage" else None,
                       "median_us": medians, "rounds": {s: timings[(name, s)] for s in medians},
                       "eager_rounds": eager[name], "eager_wall_us": wall, "checks": checks[name],
                       "packed_weight_pointers_shared": isinstance(group[0], SmallBatchGRRead)})

@@ -25,5 +25,7 @@ https://github.com/sgl-project/sglang/blob/626c64132d7f197de2053232264aeabb37ad1
 - This snapshot replaces the persistent barrier kernel with down/reduce/up
   launches and stores the SiLU activation in the input dtype (BF16 in our test).
 
-Use `bench_compare_626c6413.py` for a matched full-call CUDA Graph comparison.
-It does not replace `hc_mix_triton.py`, the existing baseline, or SGLang code.
+The final-entry comparison is `bench_small_batch.py --selected`, where this
+baseline is named `triton3stage` in printed tables and new JSONL results.
+The source filename, commit and SHA256 remain pinned above. It does not replace
+`hc_mix_triton.py`, the existing persistent baseline, or SGLang code.
