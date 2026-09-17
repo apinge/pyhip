@@ -19,7 +19,7 @@ HC = 4
 HS = 2560
 K = HC * HS
 R = 320
-MAX_ROWS = 24
+MAX_ROWS = 32
 LOG2E = 1.4426950408889634
 
 
@@ -362,7 +362,7 @@ def preshuffle_weight(weight):
 
 
 def default_config(rows):
-    """Keep the small-row path; fuse down+SiLU for the measured 17..24 bucket."""
+    """Keep the small-row path; reuse fused down+SiLU for the 17..32 tile bucket."""
     if rows > 16:
         return Config(down_mode="wave_splitk", down_n=16, down_block_k=512, down_waves=4, compensate_hidden=True)
     return Config(block_m=16, compensate_hidden=True)
@@ -375,7 +375,7 @@ class GRRead:
         config = default_config(rows) if config is None else config
         config.validate()
         if not 0 <= rows <= MAX_ROWS:
-            raise ValueError("GR read supports 0..24 rows")
+            raise ValueError(f"GR read supports 0..{MAX_ROWS} rows")
         if w_down.shape != (R, K) or w_up.shape != (K, R):
             raise ValueError("expected W_down[320,10240] and W_up[10240,320]")
         if w_down.dtype != torch.bfloat16 or w_up.dtype != torch.bfloat16:

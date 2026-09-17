@@ -1,5 +1,5 @@
 {
-  "source": "e16_wave4_fused_tuning.jsonl screening, e17_full_checkpoint_fused_down.jsonl full validation; keep e10 path for T<=16, use 256-thread wave split-K down+SiLU for T=17..24; compensation unchanged",
+  "source": "e16_wave4_fused_tuning.jsonl screening, e17_full_checkpoint_fused_down.jsonl full validation; keep e10 path for T<=16; T=25..32 reuses the unchanged T=17..24 wave split-K configuration, validated in rows32_full_checkpoint_20260916.jsonl; compensation unchanged",
   "buckets": [
     {
       "max_rows": 16,
@@ -17,7 +17,7 @@
       }
     },
     {
-      "max_rows": 24,
+      "max_rows": 32,
       "config": {
         "split_k": 16,
         "block_m": 16,

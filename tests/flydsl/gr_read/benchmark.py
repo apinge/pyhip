@@ -13,7 +13,7 @@ from pathlib import Path
 
 import torch
 import triton
-from kernel import Config, GRRead
+from kernel import MAX_ROWS, Config, GRRead
 from support import (
     BASELINE_COMMIT,
     BASELINE_PATH,
@@ -59,8 +59,8 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--previous-kernel", type=Path)
     args = parser.parse_args()
-    if any(not 1 <= row <= 24 for row in args.rows):
-        raise ValueError("benchmark rows must be 1..24")
+    if any(not 1 <= row <= MAX_ROWS for row in args.rows):
+        raise ValueError(f"benchmark rows must be 1..{MAX_ROWS}")
     if min(args.weights, args.rounds, args.samples, args.replays, args.graph_repeats) < 1:
         raise ValueError("benchmark counts must be positive")
     if not (args.model_path / "model.safetensors.index.json").is_file():

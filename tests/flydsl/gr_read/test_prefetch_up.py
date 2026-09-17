@@ -4,18 +4,18 @@ from pathlib import Path
 import pytest
 import torch
 
-from .prefetch_up import GRRead, _launchers, default_config
+from .prefetch_up import MAX_ROWS, GRRead, _launchers, default_config
 from .support import TOLERANCES, reference, synthetic
 
 
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
 def test_prefetch_up_fp64(rows):
     x, wd, wu = synthetic(rows, seed=103)
     reader = GRRead(rows, wd, wu)
     torch.testing.assert_close(reader(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
 
 
-@pytest.mark.parametrize("rows", [1, 17, 24])
+@pytest.mark.parametrize("rows", [1, 17, 24, 25, 31, 32])
 def test_prefetch_up_changed_graph_inputs(rows):
     x, wd, wu = synthetic(rows, seed=107)
     reader = GRRead(rows, wd, wu)
@@ -42,7 +42,7 @@ def test_prefetch_up_mtp_regression():
     )
 
 
-@pytest.mark.parametrize("rows", [1, 16, 24])
+@pytest.mark.parametrize("rows", [1, 16, 24, 32])
 @pytest.mark.parametrize("padding", [4, 8, 16, 32])
 def test_hidden_lds_padding(rows, padding):
     x, wd, wu = synthetic(rows, seed=109)

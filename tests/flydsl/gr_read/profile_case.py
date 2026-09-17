@@ -11,7 +11,7 @@ from pathlib import Path
 import prefetch_up
 import torch
 from combined_host import CombinedHostGRRead, CombinedThreeStageGRRead
-from kernel import Config, GRRead
+from kernel import MAX_ROWS, Config, GRRead
 from register_gate import RegisterGateGRRead
 from support import TOLERANCES, capture, checkpoint_pairs, reference
 from three_stage import ThreeStageGRRead
@@ -30,8 +30,8 @@ def main():
     parser.add_argument("--graph", action="store_true")
     parser.add_argument("--metadata", type=Path, required=True)
     args = parser.parse_args()
-    if not 1 <= args.rows <= 24 or min(args.weights, args.passes) < 1:
-        raise ValueError("rows must be 1..24 and counts positive")
+    if not 1 <= args.rows <= MAX_ROWS or min(args.weights, args.passes) < 1:
+        raise ValueError(f"rows must be 1..{MAX_ROWS} and counts positive")
     args.metadata.parent.mkdir(parents=True, exist_ok=True)
     if args.metadata.exists():
         raise FileExistsError(args.metadata)

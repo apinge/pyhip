@@ -12,8 +12,10 @@ import torch.nn.functional as F
 
 if __package__:
     from .combined_host import CombinedPaddedGRRead
+    from .prefetch_up import MAX_ROWS
 else:
     from combined_host import CombinedPaddedGRRead
+    from prefetch_up import MAX_ROWS
 
 C, H, R = 4, 2560, 320
 K = C * H
@@ -108,11 +110,11 @@ def check_graph_case(rows):
 def check_input_contract():
     x, w_down, w_up = make_case(1)
     assert CombinedPaddedGRRead(0, w_down, w_up)(x[:0]).shape == (0, H)
-    for invalid_rows in (-1, 25):
+    for invalid_rows in (-1, MAX_ROWS + 1):
         try:
             CombinedPaddedGRRead(invalid_rows, w_down, w_up)
         except ValueError as error:
-            assert "0..24" in str(error), str(error)
+            assert f"0..{MAX_ROWS}" in str(error), str(error)
         else:
             assert False, f"T={invalid_rows}: expected ValueError"
 
@@ -132,15 +134,15 @@ def check_input_contract():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rows", type=int, nargs="+", default=[1, 16, 17, 24])
+    parser.add_argument("--rows", type=int, nargs="+", default=[1, 16, 17, 24, 25, 32])
     parser.add_argument("--graph", action="store_true", help="also verify changed-input graph replay")
     parser.add_argument("--check-contract", action="store_true", help="also check empty and invalid inputs")
     parser.add_argument(
         "--debug", action="store_true", help="break after reader construction, before the real input call"
     )
     args = parser.parse_args()
-    if any(not 1 <= rows <= 24 for rows in args.rows):
-        parser.error("--rows must be in 1..24; use --check-contract to check empty and invalid inputs")
+    if any(not 1 <= rows <= MAX_ROWS for rows in args.rows):
+        parser.error(f"--rows must be in 1..{MAX_ROWS}; use --check-contract to check empty and invalid inputs")
     for rows in args.rows:
         print(check_case(rows, debug=args.debug), flush=True)
         if args.graph:

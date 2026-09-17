@@ -6,11 +6,12 @@ from .combined_host import (
     CombinedPaddedGRRead,
     CombinedThreeStageGRRead,
 )
+from .kernel import MAX_ROWS
 from .support import TOLERANCES, reference, synthetic
 
 
 @pytest.mark.parametrize("reader_type", [CombinedHostGRRead, CombinedThreeStageGRRead, CombinedPaddedGRRead])
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
 def test_combined_host_fp64(reader_type, rows):
     x, wd, wu = synthetic(rows, seed=83)
     reader = reader_type(rows, wd, wu)
@@ -18,7 +19,7 @@ def test_combined_host_fp64(reader_type, rows):
 
 
 @pytest.mark.parametrize("reader_type", [CombinedHostGRRead, CombinedThreeStageGRRead, CombinedPaddedGRRead])
-@pytest.mark.parametrize("rows", [1, 17, 24])
+@pytest.mark.parametrize("rows", [1, 17, 24, 25, 31, 32])
 def test_combined_host_changed_graph_inputs(reader_type, rows):
     x, wd, wu = synthetic(rows, seed=89)
     reader = reader_type(rows, wd, wu)

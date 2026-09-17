@@ -19,7 +19,7 @@ from combined_host import (
     CombinedPaddedGRRead,
     CombinedThreeStageGRRead,
 )
-from kernel import GRRead
+from kernel import MAX_ROWS, GRRead
 from register_gate import RegisterGateGRRead
 from support import (
     BASELINE_PATH,
@@ -104,6 +104,11 @@ def main():
     parser.add_argument("--combined-host", action="store_true")
     parser.add_argument("--baselines", action="store_true")
     parser.add_argument(
+        "--extended-triton",
+        action="store_true",
+        help="with --baselines, probe tuned Triton at ROWS=32 for T=17..32 (experimental)",
+    )
+    parser.add_argument(
         "--triton-kernel",
         type=Path,
         default=BASELINE_PATH,
@@ -123,10 +128,12 @@ def main():
     )
     args = parser.parse_args()
     if (
-        any(not 1 <= t <= 24 for t in args.rows)
+        any(not 1 <= t <= MAX_ROWS for t in args.rows)
         or min(args.weights, args.rounds, args.samples, args.eager_min_calls) < 1
     ):
-        raise ValueError("rows must be 1..24 and benchmark counts must be positive")
+        raise ValueError(f"rows must be 1..{MAX_ROWS} and benchmark counts must be positive")
+    if args.extended_triton and not args.baselines:
+        parser.error("--extended-triton requires --baselines")
     if (args.hidden_pad or args.hidden_pad_sweep) and not args.prefetch_kernel:
         raise ValueError("LDS padding options require --prefetch-kernel")
     if args.previous_kernel and not args.previous_kernel.is_file():
@@ -143,10 +150,12 @@ def main():
         else [(args.reduce_threads, args.reduce_vec)]
     )
     previous = load_flydsl_baseline(args.previous_kernel) if args.previous_kernel else None
+    if previous is not None and max(args.rows) > getattr(previous, "MAX_ROWS", MAX_ROWS):
+        parser.error("the previous kernel does not support all requested rows; omit --previous-kernel or reduce --rows")
     prefetch = load_flydsl_baseline(args.prefetch_kernel) if args.prefetch_kernel else None
     triton_baseline = torch_compiled = None
     if args.baselines:
-        if any(rows <= 16 for rows in args.rows):
+        if any(rows <= 16 for rows in args.rows) or args.extended_triton:
             if not args.triton_kernel.is_file():
                 parser.error(
                     f"Triton source not found: {args.triton_kernel}; restore baselines/hc_mix_triton.py or set --triton-kernel"
@@ -204,6 +213,8 @@ def main():
                 source_paths["hc_mix_triton.py"] = args.triton_kernel
             if args.prefetch_kernel:
                 source_paths["prefetch_kernel.py"] = args.prefetch_kernel
+            if args.extended_triton:
+                source_paths["experimental_triton.py"] = Path(__file__).with_name("experimental_triton.py")
             for name, path in source_paths.items():
                 content = path.read_bytes()
                 meta["sources"][name] = {"path": str(path), "sha256": hashlib.sha256(content).hexdigest()}
@@ -270,6 +281,12 @@ def main():
                         ReferenceReader(lambda x, wd=wd, wu=wu: triton_baseline.fused_hc_mix(x, wd, wu, 4, 2560))
                         for _, wd, wu in pairs
                     ]
+                elif args.extended_triton:
+                    from experimental_triton import ExtendedTritonGRRead
+
+                    implementations["triton_extended32"] = [
+                        ExtendedTritonGRRead(rows, wd, wu, triton_baseline) for _, wd, wu in pairs
+                    ]
             calls, graphs, graph_outputs, results = {}, {}, {}, {}
             for name, readers in implementations.items():
                 calls[name] = [lambda r=r, x=x: r(x) for r, x in zip(readers, xs)]
@@ -278,7 +295,11 @@ def main():
                 graphs[name][0].replay()
                 results[name] = {
                     "config": asdict(readers[0].config) if hasattr(readers[0], "config") else {"backend": name},
-                    **verify(graph_outputs[name], refs, enforce=name not in ("torch_compile", "tuned_triton")),
+                    **verify(
+                        graph_outputs[name],
+                        refs,
+                        enforce=name not in ("torch_compile", "tuned_triton", "triton_extended32"),
+                    ),
                     "graph_rounds": [],
                     "eager_rounds": [],
                 }
@@ -289,6 +310,11 @@ def main():
                     results[name]["ordered_gate_reduce"] = readers[0].ordered_gate_reduce
                 if name.startswith("combined_"):
                     results[name]["compiled_host_entry"] = True
+                if name == "triton_extended32":
+                    results[name]["experimental"] = True
+                    results[name]["launch_options"] = readers[0].options
+                    results[name]["resources"] = readers[0].resources
+                    assert torch.all(readers[0].counters == 0), "extended Triton counters were not reset"
             for round_id in range(args.rounds):
                 order = [(name, mode) for name in implementations for mode in ("graph", "eager")]
                 rng.shuffle(order)
@@ -307,8 +333,12 @@ def main():
                     graphs[name][0].replay()
                 result = results[name]
                 changed = verify(
-                    graph_outputs[name], changed_refs, enforce=name not in ("torch_compile", "tuned_triton")
+                    graph_outputs[name],
+                    changed_refs,
+                    enforce=name not in ("torch_compile", "tuned_triton", "triton_extended32"),
                 )
+                if name == "triton_extended32":
+                    assert torch.all(readers[0].counters == 0), "extended Triton counters were not reset"
                 result["changed_input_max_scaled_error"] = changed["max_scaled_error"]
                 result["changed_input_passed_pairs"] = changed["passed_pairs"]
                 result["graph_median_us"] = statistics.median(
@@ -330,12 +360,22 @@ def main():
                 log.flush()
             width = max(len("Backend"), max(len(name) for name in results))
             print(f"T={rows}, weights={len(pairs)}, source={weight_source}: median us / GR read", flush=True)
+            if "triton_extended32" in results:
+                print(
+                    "triton_extended32 is an experimental ROWS=32 launch, not the supported SGLang wrapper", flush=True
+                )
             print(f"{'Backend':<{width}}  {'Graph':>10}  {'Eager wall':>12}", flush=True)
             for name, result in results.items():
                 print(
                     f"{name:<{width}}  {result['graph_median_us']:>10.3f}  {result['eager_wall_median_us']:>12.3f}",
                     flush=True,
                 )
+                if result["passed_pairs"] < len(pairs) or result["changed_input_passed_pairs"] < len(pairs):
+                    print(
+                        f"  WARNING: FP64 passed {result['passed_pairs']}/{len(pairs)}, "
+                        f"changed-input replay passed {result['changed_input_passed_pairs']}/{len(pairs)}",
+                        flush=True,
+                    )
             del implementations, calls, graphs, graph_outputs, readers, refs, changed_refs, xs, graph
 
 

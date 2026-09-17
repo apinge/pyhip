@@ -6,14 +6,14 @@ from .register_gate import RegisterGateGRRead
 from .support import TOLERANCES, reference, synthetic
 
 
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, 33))
 def test_register_gate_fp64(rows):
     x, wd, wu = synthetic(rows, seed=67)
     reader = RegisterGateGRRead(rows, wd, wu)
     torch.testing.assert_close(reader(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
 
 
-@pytest.mark.parametrize("rows", [1, 7, 16, 17, 24])
+@pytest.mark.parametrize("rows", [1, 7, 16, 17, 24, 25, 32])
 def test_register_gate_stream_mapping(rows):
     x, wd, wu = synthetic(rows, seed=71)
     pattern = torch.arange(rows * 10240, device=x.device).reshape(rows, 4, 2560)
@@ -40,7 +40,7 @@ def test_register_gate_alternate_layouts(config):
     torch.testing.assert_close(reader(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
 
 
-@pytest.mark.parametrize("rows", [1, 16, 24])
+@pytest.mark.parametrize("rows", [1, 16, 24, 25, 32])
 @pytest.mark.parametrize("ordered", [False, True])
 def test_register_gate_changed_graph_inputs(rows, ordered):
     x, wd, wu = synthetic(rows, seed=79)

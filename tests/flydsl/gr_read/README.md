@@ -4,9 +4,12 @@ Standalone FlyDSL experiment. No SGLang production dispatch is changed.
 
 ## Review and Debug Start Here
 
-The final path is `CombinedPaddedGRRead` -> `_padded_pair_launcher` ->
+The original/default path is `CombinedPaddedGRRead` -> `_padded_pair_launcher` ->
 `prefetch_up._launchers` -> one selected down kernel and `up_gate`.
 Construction chooses the T bucket; a prepared reader does not change T at call time.
+The newer opt-in T=17..32 path is `LargeDownGRRead` in `large_down.py`;
+it does not replace this default. See [Accuracy Validation](#accuracy-validation)
+for separate commands testing both paths.
 
 For a final-entry-only example with explicit inputs, FP64 reference, intermediate
 checks and an optional breakpoint:
@@ -19,15 +22,15 @@ HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 test_final_entry.py --graph
 
 Unlike the older pytest-only files, `test_final_entry.py` is a plain Python script
 using `assert torch.allclose(...)`, with no pytest dependency. By default it checks
-T=1/16/17/24; `--graph` adds replay checks for the selected rows and
+T=1/16/17/24/25/32; `--graph` adds replay checks for the selected rows and
 `--check-contract` adds empty/invalid input checks. This is not the full checkpoint
 acceptance suite, and its synchronized stage checks are not performance measurements.
 See the [call-chain and manual-test guide](/opt/qwen3.8-flash-next-doc/22-GR_read_最终版调用链与手写单测_2026-09-14.md).
 
-## Latest Optimized Entry
+## Frozen Padded Entry
 
-`CombinedPaddedGRRead` in `combined_host.py` is the latest validated standalone
-candidate (E38). It keeps two GPU launches, uses a BF16 hidden LDS row stride of
+`CombinedPaddedGRRead` in `combined_host.py` is the validated E38 standalone
+entry, retained as the small-T path and large-T control. It keeps two GPU launches, uses a BF16 hidden LDS row stride of
 324 for the logical width 320, and submits both kernels through one compiled
 host entry. The selected configuration is `hidden_pad=4, prefetch_low=False`.
 Weights, global tensor shapes and high/low activation compensation are unchanged.
@@ -42,7 +45,7 @@ reader = CombinedPaddedGRRead(x.shape[0], w_down, w_up)
 y = reader(x)
 ```
 
-All 2,400 checkpoint/row combinations and changed-input graph replay checks
+The historical E38 run's 2,400 checkpoint/row combinations and changed-input graph replay checks
 passed the original FP64 tolerance. E38 full-call graph medians are 15.270 us at
 T=1 and 35.677 us at T=24, versus 18.697 / 44.386 us for the same-run E17 reference.
 Ordinary eager timings are separate: at T=1 the padded combined entry is
@@ -55,17 +58,17 @@ and [raw E38 results](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/e38_opt
 ## Contract
 
 - GPU: MI308X / gfx942. Measured with 80 compute units.
-- Input: contiguous BF16 normalized residual `X[T,10240]`, `1 <= T <= 24`.
+- Input: contiguous BF16 normalized residual `X[T,10240]`, `1 <= T <= 32`.
 - Original weights: BF16 `W_down[320,10240]`, `W_up[10240,320]`.
-- Output: BF16 `Y[T,2560]`. Zero rows return an empty output; rows above 24 are rejected.
+- Output: BF16 `Y[T,2560]`. Zero rows return an empty output; rows above 32 are rejected.
 - Formula: `mean_C(sigmoid(silu(X @ W_down.T / 4) @ W_up.T) * X)` for `C=4`.
 - RMSNorm and GR write are outside this kernel.
 
-The implementation uses two launches, with a measured row-count split:
+The frozen padded entry uses two launches, with a measured row-count split:
 
 - T=1..16: down writes 16 global FP32 K partials; up performs ordered reduction,
   SiLU, up GEMM and sigmoid/multiply/stream mean (the previous accepted path).
-- T=17..24: down uses 256 threads / 4 waves to split K **within one CTA**, reduces
+- T=17..32: down uses 256 threads / 4 waves to split K **within one CTA**, reduces
   the wave partials in LDS and applies `/4 + SiLU`. Up consumes the completed
   FP32 activation and fuses up GEMM with sigmoid/multiply/stream mean.
 
@@ -73,8 +76,8 @@ The fused-down path follows the wave split-K approach in `../test_gemm.py`.
 There is no cross-CTA counter or spin barrier. Each wave processes a K512 tile;
 four waves cover K2048 per iteration, with five iterations for K=10240. Weight
 preparation interleaves the four up-projection streams and uses the colleague's
-BF16 preshuffle layout. The T=17..24 intermediate shrinks from 640 KiB to 40 KiB.
-The fusion is available explicitly for every T=1..24, but screening did not
+BF16 preshuffle layout. The T=17..32 intermediate shrinks from 640 KiB to 40 KiB.
+The fusion is available explicitly for every T=1..32, but screening did not
 justify replacing the small-row default.
 
 **The default preserves the FP32 SiLU result as BF16 high/low components.** The up
@@ -89,6 +92,168 @@ intermediate rounding and does not pass the complete acceptance dataset.
 `Config(...)` arguments are experimental. The optimized entry above fixes the
 validated LDS padding and host submission options itself.
 
+## Accuracy Validation
+
+Run the following commands in **Bash**, from this directory. `{1..32}` expands
+to all 32 row counts; `{17..32}` expands to all 16 large-T row counts. Select an
+idle gfx942 GPU. Synthetic checks do not need SGLang or a model checkpoint.
+
+```bash
+cd /opt/pyhip/tests/flydsl/gr_read
+export HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2
+```
+
+### Reference and Pass Criteria
+
+`support.reference(x, w_down, w_up)` evaluates the full formula in FP64 using
+the **original, unpacked** weights. Do not pass `reader.w_down` / `reader.w_up`
+to the reference: those tensors have already been reordered/preshuffled.
+For BF16 output the acceptance check is:
+
+```python
+assert torch.allclose(actual.double(), expected, rtol=1e-2, atol=5e-3)
+```
+
+Equivalently, every element must have
+`abs(actual-expected)/(5e-3 + 1e-2*abs(expected)) <= 1`.
+This is a tolerance check, not bitwise equality. Keep FP32 accumulation and
+high/low compensation enabled; a BF16-intermediate Torch result is not the
+FP64 reference. Intermediate checks in `test_final_entry.py` use their own,
+tighter tolerances.
+
+### Plain Python Checks
+
+These are ordinary Python scripts with assertions, not pytest tests. An
+`AssertionError`, traceback, or nonzero exit is a failure. The default row lists
+are only subsets; use the ranges below for full coverage.
+
+```bash
+# Original/default entry, including the frozen T<=16 path and the old large-T control.
+python3 test_final_entry.py --rows {1..32} --graph --check-contract
+
+# New opt-in large-T entry: U2 for T17..25, U1 for T26..32.
+python3 test_large_down.py --selected --rows {17..32}
+```
+
+The second command checks both seeds 101/202, FP64 output, separate down/up
+calls, graph capture and changed-input replay, zero inputs, NaN-poisoned
+workspace overwrite, zero padding, shared weight pointers, and independent
+output/workspace allocations. It also checks the original T=1/8/16 entry and
+that the new entry rejects small T. `test_final_entry.py` alone does **not**
+test `LargeDownGRRead`.
+
+For one case that is easy to step through:
+
+```bash
+python3 test_final_entry.py --rows 16 --graph --debug
+python3 -m pdb test_large_down.py --selected --rows 17
+```
+
+A minimal manual output check for the currently selected path is:
+
+```python
+import torch
+from combined_host import CombinedPaddedGRRead
+from large_down import LargeDownGRRead
+from support import reference, synthetic
+
+x, w_down, w_up = synthetic(17, seed=101)
+control = CombinedPaddedGRRead(x.shape[0], w_down, w_up)
+reader = control if x.shape[0] <= 16 else LargeDownGRRead(control)
+expected = reference(x, w_down, w_up)
+actual = reader(x)
+assert torch.allclose(actual.double(), expected, rtol=1e-2, atol=5e-3)
+```
+
+### Existing Pytest Regression
+
+Explicitly list the test files. The repository's `pytest.ini` sets
+`python_files=*.py`; pointing pytest at the whole `gr_read/` directory also
+collects command-line benchmark scripts and can fail their imports before
+any numerical test executes. Do not use that collection failure as evidence
+that a GPU numerical check failed, or silently call it a passing suite.
+
+```bash
+python3 -m pytest -q \
+  test_gr_read.py test_three_stage.py test_register_gate.py \
+  test_combined_host.py test_prefetch_up.py
+```
+
+On this machine the explicit suite passed **366 tests, zero skips**, on
+2026-09-17. The plain Python scripts above are not executed by this pytest
+command and must be run separately. On another machine, an absent recorded
+MTP `.pt` fixture can cause a skip; that is not a passed MTP regression.
+
+### Full Real-Weight Acceptance
+
+Synthetic tests are not full checkpoint acceptance. For the selected T1..32
+combination, run both commands below using all 100 HC weight pairs. Input
+activations are generated; weights come from the checkpoint. These commands
+also measure performance, but the FP64/replay assertions remain mandatory.
+
+```bash
+# Frozen small-T entry; no baseline accuracy exemptions.
+python3 bench_bandwidth.py --rows {1..16} --weights 100 \
+  --model-path /models/Qwen3.8-Flash-Next-PTPC-FP8 \
+  --output /tmp/gr_small_accuracy_new.jsonl
+
+# Selected large-T entry plus the frozen control; no Torch baseline requested.
+python3 bench_large_down.py --selected --rows {17..32} --weights 100 \
+  --model-path /models/Qwen3.8-Flash-Next-PTPC-FP8 \
+  --output /tmp/gr_large_accuracy_new.jsonl
+```
+
+Use new output filenames, or omit `--output` to print only. Do not use
+`--synthetic` for checkpoint acceptance. Both commands check every weight pair
+before/after changed-input graph replay; FlyDSL mismatches abort. Expect
+1,600 initial + 1,600 changed-input checks per range, totaling 3,200 of each
+for the selected T1..32 paths. `bench_bandwidth.py` records `initial_fp64` and
+`changed_input_fp64`; `bench_large_down.py` records `checks.initial` and
+`checks.changed_replay` for each backend.
+
+The latest complete real-weight rerun passed **3,200/3,200 initial and
+3,200/3,200 changed-input checks** for selected FlyDSL. The full results and
+commands used are in the [T1..32 report](/opt/qwen3.8-flash-next-doc/29-GR_read_T1到32完整Benchmark复跑_2026-09-16.md).
+This does not validate captured production activations or model-level throughput.
+
+### Baselines and CPU Checks
+
+The optional extended Triton script tests synthetic data at ROWS=32; it is
+not the supported SGLang T<=16 wrapper and is not selected FlyDSL:
+
+```bash
+python3 test_extended_triton.py --rows {17..32}
+python3 test_benchmark_paths.py
+python3 test_bandwidth.py
+```
+
+The last two checks are CPU-only: bundled source hash / CLI paths and byte-count
+units, respectively. They do not prove GPU numerical correctness.
+
+When benchmark flags `--baselines` or `--torch-baseline` are enabled, baseline
+accuracy failures are recorded without aborting; an exit code of zero does
+**not** mean every baseline passed FP64. In the latest real-weight rerun,
+Torch passed 3,179/3,200 initial and 3,167/3,200 changed-input cases; supported
+tuned Triton passed 1,599/1,600 initial and 1,600/1,600 changed-input cases.
+Do not relax the FlyDSL tolerance to hide these failures.
+
+### Pre-commit Verification: 2026-09-17
+
+| Check | Executed coverage | Result |
+| --- | --- | --- |
+| Explicit pytest suite | The five files listed above, including recorded MTP cases | 366 passed, zero skips |
+| `test_final_entry.py` | T1..32, `--graph --check-contract` | Passed |
+| `test_large_down.py` | T17..32, `--selected`; includes frozen T1/8/16 checks | Passed |
+| `test_extended_triton.py` | T17..32 synthetic FP64, replay, padding and counters | Passed |
+| `test_benchmark_paths.py` | Bundled source and standalone CLI paths | Passed |
+| `test_bandwidth.py` | T1..32 byte counts and units | Passed |
+
+The successful pytest [JUnit record](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/e59_precommit_explicit_regression_20260917.xml)
+is retained locally. The initial whole-directory collection attempt failed on
+benchmark-script imports; the explicit command above is the verified invocation.
+The full real-weight figures above are from E55/E56 on 2026-09-16, not another
+checkpoint benchmark rerun during this pre-commit check.
+
 ## Files
 
 | File | Purpose |
@@ -96,10 +261,17 @@ validated LDS padding and host submission options itself.
 | `kernel.py` | FlyDSL kernels, preparation, shape/device guards, fixed configuration |
 | `test_gr_read.py` | BF16 correctness, graph replay, cache-key isolation, recorded rounding regression |
 | `test_final_entry.py` | Plain Python final-entry checks with `assert torch.allclose`, graph replay and `--debug` |
+| `large_down.py` | Opt-in T17..32 global/wave split-K down pipeline with the original weight format |
+| `test_large_down.py` | Plain Python selected large-T FP64, graph, padding, workspace and frozen-boundary checks |
+| `bench_large_down.py` | Matched large-T control/selected comparison and all-pair real-weight accuracy checks |
 | `support.py` | FP64 reference, bundled Triton baseline loading, checkpoint loading and timing |
 | `baselines/hc_mix_triton.py` | Unmodified `8cf5501b` Triton baseline, bundled with upstream Apache-2.0 license |
 | `test_benchmark_paths.py` | Plain Python CPU checks for bundled baseline, loader cache and configurable input paths |
-| `benchmark.py` | All 100 checkpoint pairs, all 24 row counts, randomized order, optional previous FlyDSL baseline |
+| `bench_bandwidth.py` | Final `combined_padded` T=1..32 graph timing and logical effective bandwidth; no model required by default |
+| `test_bandwidth.py` | CPU-only byte-count and cudaPerf-compatible GB/s conversion checks |
+| `benchmark.py` | Checkpoint correctness and matched timings; supports rows through 32 and optional previous FlyDSL baseline |
+| `experimental_triton.py` | Opt-in ROWS=32 probe of the original tuned Triton kernel; not its production wrapper |
+| `test_extended_triton.py` | Plain Python FP64, changed-input graph and barrier-counter checks for the Triton extension |
 | `selected_configs.json` | Accepted per-row configurations with activation compensation enabled |
 | `tune.py` | Explicit, recorded configuration sweeps, including `--family wave_fused` |
 | `quick_bench.py` | Single-weight screening, optional individual-stage timings |
@@ -224,7 +396,7 @@ metadata and source snapshots are needed; existing files are never overwritten.
 For a checkpoint stored elsewhere, append `--model-path /path/to/Qwen3.8-Flash-Next-FP8`.
 The default Triton baseline follows the repository location, not `/opt/sglang`.
 Sync the `baselines/` directory along with the scripts when moving to another
-machine. A `--baselines` run with only T=17..24 uses Torch compile and does not
+machine. A `--baselines` run with only T=17..32 uses Torch compile and does not
 load Triton. Run `python3 test_benchmark_paths.py` for CPU-only path checks.
 
 SGLang is optional for all these standalone kernel checks. Without
@@ -255,7 +427,77 @@ To reproduce the original E38 backend set, explicitly pass the preserved
 The eager measurements include the ordinary Python/runtime submission path and
 batch-boundary synchronization. They are not pure hardware launch-cost measurements
 or single-request synchronized latency. Graph timings do not substitute for eager.
-The padded candidate is still limited to T<=24; it is not a prefill implementation.
+The padded candidate is limited to T<=32; it is not a general prefill implementation.
+
+## Rows 25 Through 32
+
+The 17..24 algorithm is reused without changing GPU kernel bodies or tuning
+parameters: T=17..32 all use `block_m=16`, `padded_rows=32`, down grid `(2,20,1)`,
+up grid `(2,80,1)`, and a 40 KiB FP32 activation buffer. The reader and CLI limits
+now permit 32 rows. Default two-kernel selection is unchanged for T<=24.
+
+The added 800 real-weight/row combinations and changed-input replay checks
+passed the unchanged FP64 tolerance; the expanded regression suite passed 366
+tests. The final two-kernel graph path is about 30 us at T=25..32 in the same-run
+comparison, but Torch compile is faster at 6 of the 8 row counts and has some
+FP64 tolerance failures. See the [extension report](/opt/qwen3.8-flash-next-doc/24-GR_read_T25到32复用与基线比较_2026-09-16.md)
+and [raw results](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/rows32_full_checkpoint_20260916.jsonl).
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 test_final_entry.py --rows 24 25 26 27 28 29 30 31 32 --graph --check-contract
+
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 bench_three_stage.py --synthetic --rows 24 25 26 27 28 29 30 31 32 \
+  --weights 100 --rounds 3 --samples 7 --combined-host --baselines --extended-triton \
+  --prefetch-kernel ./prefetch_up.py --hidden-pad 4 --reduce-threads 128 --reduce-vec 1
+```
+
+Omit `--synthetic` to use real checkpoint weights. `--extended-triton` is an
+explicit experiment: it launches the unchanged baseline kernel at `ROWS=32`
+with the existing gfx942 tuning parameters and labels it `triton_extended32`.
+It does not alter the bundled source, the supported `tuned_triton` T<=16
+baseline, or SGLang dispatch. Its buffers are prepared before timing; its eager
+host path therefore differs from the original allocating Triton wrapper.
+Without this flag, T>16 continues to compare only against Torch compile.
+An explicitly selected old V1 source may still reject rows above 24.
+
+## Effective Bandwidth
+
+`bench_bandwidth.py` measures only the final `CombinedPaddedGRRead` entry for
+T=1..32. It defaults to 100 synthetic weight pairs and console output, so no
+model, SGLang installation, baseline source or output file is required:
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 bench_bandwidth.py
+```
+
+For the real-weight measurement matching the PTPC launch script:
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 bench_bandwidth.py --model-path /models/Qwen3.8-Flash-Next-PTPC-FP8 \
+  --output /tmp/gr_read_bandwidth_new.jsonl
+```
+
+The GB/s conversion matches `pyhip.cudaPerf`: `bytes / latency_us / 1000`.
+The byte model counts the full GR operator's external BF16 tensors once:
+`Read = X + W_down + W_up = 13107200 + 20480*T` bytes and
+`I/O = Read + Y = 13107200 + 25600*T` bytes. Like the CK GEMM example, the
+Read column excludes output stores; I/O adds only the final Y stores.
+The denominator uses the existing full-call graph event timer, with 100 weight
+pairs rotated twice per graph, 3 replays/sample and 21 samples by default.
+
+These are logical effective bandwidths, not measured HBM traffic: workspace
+transactions, duplicated CTA/wave loads, LDS accesses and cache behavior are
+not counted. `Scratch KiB` is buffer capacity, not traffic added to the numerator.
+Weight preparation and correctness checks are outside timing. Use
+`python3 test_bandwidth.py` to check byte counts and units without a GPU.
+
+The full PTPC checkpoint run passed 3,200 initial and 3,200 changed-input FP64
+checks. Logical Read bandwidth was 1032.5 GB/s at T=1, 664.3 GB/s at T=16,
+and 448-458 GB/s at T=17..32. See the [bandwidth report](/opt/qwen3.8-flash-next-doc/26-GR_read_最优FlyDSL_T1到32有效带宽_2026-09-16.md)
+for all rows, the byte model and raw samples; these are not HBM counters.
 
 ## Historical E17 Results
 
@@ -285,3 +527,55 @@ Final T=24 IR comparison:
 [isa_summary_e17.json](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/isa_summary_e17.json).
 The later 2/4-accumulator probe did not improve T=24 and was not adopted; its
 source snapshots, raw measurements and IR remain in the local result directory.
+
+## Large-T Down Experiments (2026-09-16)
+
+`large_down.py` is an opt-in candidate for T=17..32, not a change to the default
+entry or the T<=16 path. Both weights keep the original preshuffle format;
+W_up still uses the logical `c*H+h -> h*C+c` reorder. The candidate shares the
+control's weight pointers, with separate P/Y allocations:
+
+```python
+from combined_host import CombinedPaddedGRRead
+from large_down import LargeDownGRRead
+
+control = CombinedPaddedGRRead(rows, w_down, w_up)
+candidate = LargeDownGRRead(control)
+y = candidate(x)
+# Debug the two stages separately:
+candidate.run_down(x)
+partials = candidate.partial.view(4, 32, 320)  # linear sums, before /4 and SiLU
+candidate.run_up(x)
+```
+
+For `global_split=1`, down still fuses SiLU and P is FP32 `[32,320]`.
+For `global_split=2/4`, down writes linear partials; the existing up partial
+path reduces all splits, then applies `/4 + SiLU`, high/low conversion, the
+up GEMM and gated mean. Both cases launch exactly two GPU kernels. The new
+GPU kernel is `down_wave_splitk_pipeline`; up still uses `up_gate`.
+The opt-in default uses BM32/BK128/4 waves/global split=4. T=17..25 uses
+two-beat prefetch; T=26..32 uses one-beat prefetch. Explicit `DownConfig`
+overrides remain available for experiments.
+
+Plain Python tests and a synthetic-weight benchmark (no checkpoint needed):
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 test_large_down.py --selected
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+  python3 bench_large_down.py --selected --rows 17 24 32 --eager --torch-baseline
+```
+
+Add `--model-path /models/Qwen3.8-Flash-Next-PTPC-FP8` for real HC weights.
+`--output /tmp/new_run.jsonl` is optional and refuses to overwrite an existing
+file. Default timing uses 100 weights, 3 rounds, 7 samples, 200 full calls per
+graph and 3 replays per sample; candidate/stage order is randomized per round.
+`Full graph` is the complete GR call. `Down only`/`Up only` are isolated graph
+repeats and must not be added to reconstruct full latency. `Eager wall` is
+full-call host wall time, not an isolated device-kernel time.
+
+All FlyDSL candidates must pass the original FP64 tolerance. The optional
+Torch baseline records failures without aborting, matching the historical
+benchmark convention. Source snapshots and raw samples accompany JSONL output;
+the benchmark never reads historical result files. Findings and negative
+experiments are recorded in the [large-down report](/opt/qwen3.8-flash-next-doc/28-GR_read_大T_Down预取与GlobalSplitK实验_2026-09-16.md).

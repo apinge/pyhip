@@ -3,11 +3,11 @@ from dataclasses import replace
 import pytest
 import torch
 
-from .kernel import Config, GRRead, _launchers
+from .kernel import MAX_ROWS, Config, GRRead, _launchers
 from .support import TOLERANCES, reference, synthetic, torch_mix
 
 
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
 def test_matches_fp64(rows):
     dtype = torch.bfloat16
     x, wd, wu = synthetic(rows, dtype)
@@ -25,7 +25,7 @@ def test_matches_fp64(rows):
         )
 
 
-@pytest.mark.parametrize("rows", [1, 4, 7, 16, 17, 24])
+@pytest.mark.parametrize("rows", [1, 4, 7, 16, 17, 24, 25, 31, 32])
 def test_graph_observes_changed_inputs(rows):
     x, wd, wu = synthetic(rows, seed=7)
     kernel = GRRead(rows, wd, wu)
@@ -41,7 +41,7 @@ def test_graph_observes_changed_inputs(rows):
         torch.testing.assert_close(actual.double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
 
 
-@pytest.mark.parametrize("rows", [1, 24])
+@pytest.mark.parametrize("rows", [1, 24, 32])
 def test_zero_weights_give_stream_mean(rows):
     x, wd, wu = synthetic(rows, seed=11)
     wd.zero_()
@@ -53,8 +53,8 @@ def test_zero_weights_give_stream_mean(rows):
 
 def test_range_and_layout_contract():
     x, wd, wu = synthetic(1)
-    for rows in (-1, 25, 32):
-        with pytest.raises(ValueError, match="0..24"):
+    for rows in (-1, MAX_ROWS + 1, 64):
+        with pytest.raises(ValueError, match=f"0..{MAX_ROWS}"):
             GRRead(rows, wd, wu)
     with pytest.raises(ValueError, match="BF16"):
         GRRead(1, wd.half(), wu.half())
@@ -109,7 +109,7 @@ def test_checkpoint_mtp_activation_rounding_regression():
     assert ((legacy.double() - ref).abs() / (tol["atol"] + tol["rtol"] * ref.abs())).max() > 1
 
 
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
 def test_fused_down_wave_splitk(rows):
     x, wd, wu = synthetic(rows, seed=43)
     config = Config(down_mode="wave_splitk", down_n=16, down_waves=4, down_block_k=512, compensate_hidden=True)
@@ -119,7 +119,7 @@ def test_fused_down_wave_splitk(rows):
     torch.testing.assert_close(kernel.partial.reshape(-1, 320)[:rows].double(), activation, rtol=2e-5, atol=2e-5)
 
 
-@pytest.mark.parametrize("rows", [1, 17, 24])
+@pytest.mark.parametrize("rows", [1, 17, 24, 25, 31, 32])
 def test_fused_down_repeated_graph_replay(rows):
     x, wd, wu = synthetic(rows, seed=47)
     kernel = GRRead(rows, wd, wu, Config(down_mode="wave_splitk", down_n=16, down_block_k=512, compensate_hidden=True))

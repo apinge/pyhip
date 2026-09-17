@@ -3,11 +3,12 @@ from pathlib import Path
 import pytest
 import torch
 
+from .kernel import MAX_ROWS
 from .support import TOLERANCES, reference, synthetic
 from .three_stage import ThreeStageGRRead, _reduce_launcher
 
 
-@pytest.mark.parametrize("rows", range(1, 25))
+@pytest.mark.parametrize("rows", range(1, MAX_ROWS + 1))
 def test_three_stage_fp64(rows):
     x, wd, wu = synthetic(rows, seed=53)
     reader = ThreeStageGRRead(rows, wd, wu)
@@ -25,7 +26,7 @@ def test_reducer_configurations(threads, vec):
     torch.testing.assert_close(reader(x).double(), reference(x, wd, wu), **TOLERANCES[x.dtype])
 
 
-@pytest.mark.parametrize("rows", [1, 17, 24])
+@pytest.mark.parametrize("rows", [1, 17, 24, 25, 31, 32])
 def test_three_stage_changed_graph_inputs(rows):
     x, wd, wu = synthetic(rows, seed=61)
     reader = ThreeStageGRRead(rows, wd, wu)
@@ -51,8 +52,8 @@ def test_reducer_cache_keys():
 def test_three_stage_contract():
     x, wd, wu = synthetic(1)
     assert ThreeStageGRRead(0, wd, wu)(x[:0]).shape == (0, 2560)
-    with pytest.raises(ValueError, match="0..24"):
-        ThreeStageGRRead(25, wd, wu)
+    with pytest.raises(ValueError, match=f"0..{MAX_ROWS}"):
+        ThreeStageGRRead(MAX_ROWS + 1, wd, wu)
     with pytest.raises(ValueError, match="reducer"):
         ThreeStageGRRead(1, wd, wu, reduce_threads=32)
     with pytest.raises(ValueError, match="BF16"):
