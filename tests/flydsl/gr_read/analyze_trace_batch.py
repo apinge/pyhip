@@ -6,6 +6,7 @@ import csv
 import hashlib
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -15,6 +16,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("directories", nargs="+", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--kernel-regex", help="only analyze matching kernel names")
     parser.add_argument(
         "--analyzer",
         type=Path,
@@ -44,6 +46,8 @@ def main():
         for dispatch in sorted(directory.glob("ui_output_agent_*_dispatch_*")):
             row = by_id[dispatch.name.rsplit("_", 1)[-1]]
             name = row["Kernel_Name"]
+            if args.kernel_regex and not re.search(args.kernel_regex, name):
+                continue
             command = [
                 sys.executable,
                 str(args.analyzer),

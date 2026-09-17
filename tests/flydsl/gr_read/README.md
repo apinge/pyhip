@@ -2,9 +2,57 @@
 
 Standalone FlyDSL experiment. No SGLang production dispatch is changed.
 
-## Graph Comparison with Colleague 626c6413
+## Selected T1..16 Pipeline: Fixed Weight Layout
 
-For the requested T1..16 comparison, this single command runs both our selected
+The new opt-in `SmallBatchGRRead` reuses the existing packed weights without
+changing the prefill/decode weight contract. It uses BM16, four global K
+partials, CTA-local wave reduction and two-beat prefetch. Up uses BN128 for
+T1..6 and T16, and BN64 for T7..15, with four waves and high/low compensation retained.
+The intermediate is FP32 `[4,16,320]` (80 KiB); there are still two GPU kernels.
+The frozen `CombinedPaddedGRRead` and T17..32 `LargeDownGRRead` selection are unchanged.
+
+One command compares the old path, colleague 626c6413, and the new candidate,
+with no model required:
+
+```bash
+cd /opt/pyhip/tests/flydsl/gr_read
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 \
+python3 bench_small_batch.py --selected --synthetic --rows {1..16} \
+  --weights 100 --rounds 3 --samples 7
+```
+
+Read **`ours_optimized` / `Full graph`**. `frozen` is the previous padded
+two-kernel path; `colleague_626c6413` is the unchanged upstream three-stage
+wrapper. `--eager` and `--stages` add optional diagnostics. Replace `--synthetic`
+with `--model-path /path/to/checkpoint` for real HC weights; output is optional.
+
+```python
+from combined_host import CombinedPaddedGRRead
+from small_batch import SmallBatchGRRead
+
+prepared = CombinedPaddedGRRead(rows, w_down_original, w_up_original)
+reader = SmallBatchGRRead(prepared)  # T1..16; original weights packed once
+y = reader(x)
+```
+
+`SmallBatchGRRead` shares `prepared.w_down/w_up` but owns separate P/Y. It is
+not silently installed into `CombinedPaddedGRRead` or SGLang. Use
+`python3 test_small_batch.py --rows {1..16}` for plain Python FP64/replay,
+padding, and packed-weight immutability checks. The original low-level
+dispatch argument order is retained, but P must match the new 80 KiB layout.
+
+Two 100-weight checkpoint runs beat the colleague at every tested T8..16;
+the independent seed-202 run measured 1.140-1.216x graph speedup. The T1..7
+extension also improves every full graph over the frozen path (E73 checkpoint
+screen: 6.3-18.1% lower latency), without a fallback point. This does not imply
+uniform eager-wall improvement. See the
+[optimization and ATT report](/opt/qwen3.8-flash-next-doc/32-GR_read_T8到16固定WeightLayout优化与ATT_2026-09-17.md)
+for configurations, failed experiments, raw data and evidence. gfx950 performance
+has not been validated here.
+
+## Frozen-path Graph Comparison with Colleague 626c6413
+
+For the preserved T1..16 comparison, this command runs both our previous
 two-kernel path and the colleague's unmodified three-stage Triton wrapper.
 No model, SGLang installation, output file, or historical results are required:
 
@@ -31,8 +79,8 @@ the colleague's three-stage path was faster at T8..16. Full tables and method:
 The original/default path is `CombinedPaddedGRRead` -> `_padded_pair_launcher` ->
 `prefetch_up._launchers` -> one selected down kernel and `up_gate`.
 Construction chooses the T bucket; a prepared reader does not change T at call time.
-The newer opt-in T=17..32 path is `LargeDownGRRead` in `large_down.py`;
-it does not replace this default. See [Accuracy Validation](#accuracy-validation)
+The opt-in T=1..16 path is `SmallBatchGRRead`; T=17..32 uses `LargeDownGRRead`.
+Neither replaces this default. See [Accuracy Validation](#accuracy-validation)
 for separate commands testing both paths.
 For weight preparation, scratch allocation, and graph lifetime rules, see
 [Weight and Workspace Interface](#weight-and-workspace-interface).
@@ -58,7 +106,7 @@ See the [call-chain and manual-test guide](/opt/qwen3.8-flash-next-doc/22-GR_rea
 ## Frozen Padded Entry
 
 `CombinedPaddedGRRead` in `combined_host.py` is the validated E38 standalone
-entry, retained as the small-T path and large-T control. It keeps two GPU launches, uses a BF16 hidden LDS row stride of
+entry, retained as the frozen small-T and large-T controls. It keeps two GPU launches, uses a BF16 hidden LDS row stride of
 324 for the logical width 320, and submits both kernels through one compiled
 host entry. The selected configuration is `hidden_pad=4, prefetch_low=False`.
 Weights, global tensor shapes and high/low activation compensation are unchanged.
@@ -124,8 +172,11 @@ validated LDS padding and host submission options itself.
 
 ## Weight and Workspace Interface
 
-This section describes the **current selected paths**: `CombinedPaddedGRRead`
-for T=1..16 and `LargeDownGRRead` for T=17..32. The old large-T control is listed
+This section's runnable examples describe the **preserved reference paths**:
+`CombinedPaddedGRRead` for T=1..16 and `LargeDownGRRead` for T=17..32. The new
+`SmallBatchGRRead` shares the same weight/dispatch contracts but uses the 80 KiB
+P layout listed below; its preparation example is in the section above.
+The old large-T control is listed
 separately because its intermediate has different semantics. These are
 inference-only interfaces; no autograd or automatic weight-update propagation
 is implemented.
@@ -232,7 +283,8 @@ Its useful debug view depends on the selected path:
 
 | Path | T | Debug view of P | FP32 elements / bytes | What down writes |
 | --- | --- | --- | --- | --- |
-| Selected small T | 1..16 | `[16,16,320]` | 81,920 / 327,680 (320 KiB) | 16 linear K partials, before `/4` and SiLU |
+| Frozen small T | 1..16 | `[16,16,320]` | 81,920 / 327,680 (320 KiB) | 16 linear K partials, before `/4` and SiLU |
+| New `SmallBatchGRRead` | 1..16 | `[4,16,320]` | 20,480 / 81,920 (80 KiB) | 4 linear K partials after CTA-local wave reduction |
 | Selected large T, U1/U2 | 17..32 | `[4,32,320]` | 40,960 / 163,840 (160 KiB) | 4 linear K partials, already reduced across the 4 waves within each CTA |
 | Old large-T `CombinedPaddedGRRead` control | 17..32 | `[32,320]` | 10,240 / 40,960 (40 KiB) | Completed FP32 `silu((X @ W_down.T)/4)` |
 
@@ -241,8 +293,9 @@ offset `(split_index*T_pad + row)*R + rank`. The FlyDSL source expresses the
 same storage as shape `(T_pad,R,split)` with strides `(R,1,T_pad*R)`; that does
 not mean a contiguous Torch `[T_pad,R,split]` view has the right meaning.
 
-Each small-T global split covers 640 K elements. Each selected large-T global
-split covers 2560 K elements, internally divided among four waves. Thus
+Each frozen small-T global split covers 640 K elements. Both `SmallBatchGRRead`
+and `LargeDownGRRead` selected global splits cover 2560 K elements, internally
+divided among four waves. Thus
 `P.view(S,T_pad,R).sum(0)[:T]` is the linear down result, before `/4` and SiLU.
 Do not apply SiLU independently to each split. Up performs the complete
 reduction, `/4`, SiLU, high/low conversion, and up GEMM in the second kernel.
@@ -253,8 +306,8 @@ the old large-T control stores an activated result there. Experimental
 activation in `[32,320]`; global split=2 stores linear partials in `[2,32,320]`.
 Do not mix P from one path with another path's compiled up kernel.
 
-For selected paths, T_pad=16 at T<=16 and T_pad=32 at T>=17. T=1 still needs
-the full 320 KiB P allocation, and T=17 still needs 160 KiB. Y is only `[T,H]`,
+T_pad=16 at T<=16 and T_pad=32 at T>=17. The frozen T=1 path still needs
+the full 320 KiB P allocation; new T1..16 uses 80 KiB, and T=17 uses 160 KiB. Y is only `[T,H]`,
 not `[T_pad,H]`. For other experimental configurations, derive the dimensions
 from that configuration rather than reusing this selected-path table.
 
@@ -277,7 +330,7 @@ reader.up(X_flat, WU_packed, P_flat, Y_flat, stream)
 reader.dispatch(X_flat, WD_packed, WU_packed, P_flat, Y_flat, stream)
 ```
 
-For the **selected reader prepared above**, the following uses explicit P/Y
+For the **reference reader prepared in this section above**, the following uses explicit P/Y
 and the separately packed weights above, without changing any kernel:
 
 ```python
@@ -296,6 +349,8 @@ rebind the reader's owned buffers. Likewise, `reader.run_down(x)` and
 `reader.run_up(x)` use `reader.partial`, not the external P above. If manually
 launching the two compiled handles, pass the same P and the same X values to
 both stages, with down ordered before up.
+For `SmallBatchGRRead`, use `S=4, T_pad=16` instead, or allocate
+`torch.empty_like(reader.partial)`; do not copy the frozen-small split=16 formula.
 
 All flat arguments must match the prepared dtype, element count, contiguous
 layout, and device. Use normal Torch allocations; a custom suballocator must
@@ -394,6 +449,9 @@ python3 test_final_entry.py --rows {1..32} --graph --check-contract
 
 # New opt-in large-T entry: U2 for T17..25, U1 for T26..32.
 python3 test_large_down.py --selected --rows {17..32}
+
+# New T1..16 pipeline, including packed-weight byte equality checks.
+python3 test_small_batch.py --rows {1..16}
 ```
 
 The second command checks both seeds 101/202, FP64 output, separate down/up
@@ -416,11 +474,12 @@ A minimal manual output check for the currently selected path is:
 import torch
 from combined_host import CombinedPaddedGRRead
 from large_down import LargeDownGRRead
+from small_batch import SmallBatchGRRead
 from support import reference, synthetic
 
 x, w_down, w_up = synthetic(17, seed=101)
 control = CombinedPaddedGRRead(x.shape[0], w_down, w_up)
-reader = control if x.shape[0] <= 16 else LargeDownGRRead(control)
+reader = SmallBatchGRRead(control) if x.shape[0] <= 16 else LargeDownGRRead(control)
 expected = reference(x, w_down, w_up)
 actual = reader(x)
 assert torch.allclose(actual.double(), expected, rtol=1e-2, atol=5e-3)
@@ -447,8 +506,8 @@ MTP `.pt` fixture can cause a skip; that is not a passed MTP regression.
 
 ### Full Real-Weight Acceptance
 
-Synthetic tests are not full checkpoint acceptance. For the selected T1..32
-combination, run both commands below using all 100 HC weight pairs. Input
+Synthetic tests are not full checkpoint acceptance. For the preserved T1..32
+reference combination, run both commands below using all 100 HC weight pairs. Input
 activations are generated; weights come from the checkpoint. These commands
 also measure performance, but the FP64/replay assertions remain mandatory.
 
@@ -473,9 +532,27 @@ for the selected T1..32 paths. `bench_bandwidth.py` records `initial_fp64` and
 `checks.changed_replay` for each backend.
 
 The latest complete real-weight rerun passed **3,200/3,200 initial and
-3,200/3,200 changed-input checks** for selected FlyDSL. The full results and
+3,200/3,200 changed-input checks** for the pre-SmallBatch FlyDSL selection. The full results and
 commands used are in the [T1..32 report](/opt/qwen3.8-flash-next-doc/29-GR_read_T1到32完整Benchmark复跑_2026-09-16.md).
 This does not validate captured production activations or model-level throughput.
+
+To validate the new T1..16 pipeline against all 100 real HC weight pairs:
+
+```bash
+python3 bench_small_batch.py --selected --rows {1..16} --weights 100 \
+  --model-path /models/Qwen3.8-Flash-Next-PTPC-FP8 \
+  --output /tmp/gr_small_batch_accuracy_new.jsonl
+```
+
+It must pass 1,600 initial and 1,600 changed-input checks (`checks.initial` and
+`checks.changed` in the result records). The original FP64 tolerance is unchanged;
+the frozen control is checked separately.
+
+The selected T1..16 seed-202 checkpoint rerun passed all 1,600 initial and
+1,600 changed-input checks (maximum scaled error 0.30545). Every full graph
+beat both frozen and colleague controls; T1..7 latency fell 6.7-18.2% versus
+frozen. Eager wall did not improve at every T. Raw samples and source snapshots:
+[E74 full T1..16](/opt/qwen3.8-flash-next-doc/gr_read_flydsl_results/e74_small_selected_t1_t16_checkpoint_seed202_20260917.jsonl).
 
 ### Baselines and CPU Checks
 
@@ -526,6 +603,9 @@ checkpoint benchmark rerun during this pre-commit check.
 | `test_final_entry.py` | Plain Python final-entry checks with `assert torch.allclose`, graph replay and `--debug` |
 | `large_down.py` | Opt-in T17..32 global/wave split-K down pipeline with the original weight format |
 | `test_large_down.py` | Plain Python selected large-T FP64, graph, padding, workspace and frozen-boundary checks |
+| `small_batch.py` | Opt-in T1..16 split4 pipeline; unchanged packed weights, per-T up BN64/128 |
+| `bench_small_batch.py` | Full graph comparison of frozen / colleague / optimized T1..16, plus optional stages/eager |
+| `test_small_batch.py` | Plain Python FP64/replay, workspace, padding and immutable packed-weight checks |
 | `bench_large_down.py` | Matched large-T control/selected comparison and all-pair real-weight accuracy checks |
 | `support.py` | FP64 reference, bundled Triton baseline loading, checkpoint loading and timing |
 | `baselines/hc_mix_triton.py` | Unmodified `8cf5501b` Triton baseline, bundled with upstream Apache-2.0 license |

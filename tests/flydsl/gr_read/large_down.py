@@ -1,7 +1,8 @@
 """Experimental large-T down pipeline; weight format and up source are unchanged.
 
-Only 17..32 rows are accepted. Construct from CombinedPaddedGRRead to reuse
-the exact same preshuffled weight allocations, with separate P/Y workspaces.
+LargeDownGRRead accepts only 17..32 rows. Its launch factories are also reused
+by the separate BM16 small-batch experiment. Construct from CombinedPaddedGRRead
+to reuse the exact same preshuffled weights, with separate P/Y workspaces.
 Split=1 fuses SiLU in down. Split>1 writes linear partials; the existing up
 partial path sums these before SiLU. Neither variant adds a third kernel.
 """
@@ -70,7 +71,8 @@ def down_launcher(rows, config):
     prefetch, interleave = config.prefetch, config.interleave
     split = config.global_split
     prefetch_unroll = config.prefetch_unroll
-    dn, iterations, padded_rows = 16, K // waves // bk // split, 32
+    dn, iterations = 16, K // waves // bk // split
+    padded_rows = (rows + bm - 1) // bm * bm
 
     @fx.struct
     class DownShared:
@@ -194,7 +196,7 @@ def pair_launcher(rows, down_config, up_config):
 
     @flyc.jit
     def launch(X: fx.Tensor, WD: fx.Tensor, WU: fx.Tensor, P: fx.Tensor, Y: fx.Tensor, stream: fx.Stream):
-        if fx.const_expr(rows > 16):
+        if fx.const_expr(rows > 0):
             down(X, WD, P, stream)
             up(X, WU, P, Y, stream)
 
