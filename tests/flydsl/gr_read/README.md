@@ -15,6 +15,11 @@ Chinese instructions:
 [benchmark, accuracy and interfaces](/opt/qwen3.8-flash-next-doc/33-GR_read_使用指南_Benchmark精度校验与算法接口_2026-09-17.md).
 Algorithm overview: [report 30](/opt/qwen3.8-flash-next-doc/30-GR_read_当前算法简述_2026-09-17.md).
 
+For framework integration with weights packed at model load, read
+[INTEGRATION.md](INTEGRATION.md). It covers the distinction between captured B,
+live M and internal tile padding, the actual SGLang padding policies, and a
+tested direct-from-packed launcher recipe. Do not repack once per bucket.
+
 ## Quick Start
 
 Run from this directory in **Bash**. Select an idle physical GPU; change 2 for
@@ -163,6 +168,18 @@ BN64/128 configurations and packed-weight byte equality. Both check range
 rejection; the large test also checks frozen T1/8/16 controls.
 Exceptions or nonzero exit are failures. Do not use `python -O`, which removes
 assertions. These are correctness/debug calls, not performance measurements.
+
+To test a larger captured graph with fewer live rows, including every B=1..32
+and M=B..0..B, run the dedicated contract test:
+
+```bash
+python3 test_graph_buckets.py --synthetic --buckets {1..32} --weights 2
+```
+
+This captures once per bucket and changes the live prefix without recapture;
+it tests zero/stale/NaN tails, poisoned P/Y, guards and shared packed weights.
+The all-100-checkpoint command and results are in INTEGRATION.md. It is not a
+whole-model SGLang test or a performance benchmark.
 
 The real-weight benchmark commands above check every pair before and after
 changed-input graph replay. Each selected range must pass 1,600 initial and
@@ -439,6 +456,7 @@ replay. These are interface checks, not another full performance run.
 | `bench_small_batch.py`, `bench_large_down.py` | Current full-call benchmarks and real-weight checks |
 | `test_final_entry.py` | Main final T1..32 plain Python correctness/debug entry; automatically selects Small/Large |
 | `test_small_batch.py`, `test_large_down.py` | Supplementary per-backend configuration tests |
+| `test_graph_buckets.py` | Load-once packing, raw packed launchers and larger-bucket/smaller-live graph correctness |
 | `support.py` | FP64 reference, synthetic/checkpoint data, graph timing |
 | `baselines/` | Unmodified bundled Triton sources, provenance and license |
 | `analyze_trace_batch.py` | Supplied FlyDSL ATT analyzer wrapper; optional kernel-name filter |
@@ -454,3 +472,21 @@ There is no SGLang/AITER environment switch required for these standalone
 FlyDSL calls. AITER attention/MoE configuration in a model launch is unrelated
 to this standalone entry. Preserving the packing contract does not itself
 integrate the kernel into a serving framework.
+
+## Separate H64 Shared-Weight Entry
+
+The new opt-in `h64_layout.H64GRRead` consumes the H64/stream/lane layout from
+prefill commit `3f472e33`, sharing one packed weight pair with prefill. The old
+entries described above are unchanged and cannot consume this new W_up.
+See [H64_LAYOUT.md](H64_LAYOUT.md) for the exact load-time permutation, pointer
+ownership, P padding, capture-B/replay-M contract and selected algorithm.
+
+```bash
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 test_h64_layout.py
+HIP_VISIBLE_DEVICES=2 CUDA_VISIBLE_DEVICES=2 python3 bench_h64_layout.py \
+  --selected --check-no-regression --synthetic --rows {1..32} \
+  --weights 100 --rounds 3 --samples 7
+```
+
+No model is needed for these commands. Compare the complete `Full graph`
+column for `h64_selected` against `baseline_selected`; `--output` is optional.
